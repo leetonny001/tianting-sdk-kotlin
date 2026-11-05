@@ -2,6 +2,7 @@ package com.tianting.sdk
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -124,10 +125,12 @@ public class IMClient(private val o: IMClientOptions) {
         null
     }
     private val dispatcher: CoroutineDispatcher = o.dispatcher ?: executor!!.asCoroutineDispatcher()
-    private val scope = CoroutineScope(SupervisorJob() + dispatcher)
+    private val log = o.logger
+
+    // 协程里漏出来的异常不能走默认处理：Android 上默认处理会让 App 崩溃。
+    private val scope = CoroutineScope(SupervisorJob() + dispatcher + CoroutineExceptionHandler { _, e -> log.error("im: unexpected ${safeDescribe(e)}") })
     private val t = o.timings
     private val clock: Clock = o.clock ?: CoroutineClock(scope)
-    private val log = o.logger
     private val local: LocalDb? = o.database?.let { LocalDb(it, log) }
     private var store = Store({ self }, local ?: NoStoreSink)
     private val social = SocialState(local)
@@ -288,13 +291,15 @@ public class IMClient(private val o: IMClientOptions) {
 
     /**
      * 发送文本。先在本地插入一条"发送中"（离线时"排队"）的消息，ack 后更新为已发送。
-     * 文本为空或超过 5000 字时不发送，返回原因。还不知道自己是谁（没连接成功过，本地库也没有）时抛 NotConnectedError。
+     * 文本为空或超过 5000 字时不发送，返回原因。还不知道自己是谁（没连接成功过，本地库也没有）时抛 NotConnectedError；
+     * 会话 ID 不合法时抛 IllegalArgumentException。
      */
     public suspend fun send(convId: String, text: String): SendResult = onSdk {
         when (val check = checkText(text)) {
             is TextCheck.Rejected -> SendResult.Rejected(check.reason, check.over)
             is TextCheck.Ok -> {
                 if (self.isEmpty()) throw NotConnectedError()
+                parseConvId(convId, self) // 不合法的会话 ID 在这里抛出，不能留下一条永远"发送中"的消息
                 val msg = Message(
                     clientMsgId = o.newId(),
                     convId = convId,

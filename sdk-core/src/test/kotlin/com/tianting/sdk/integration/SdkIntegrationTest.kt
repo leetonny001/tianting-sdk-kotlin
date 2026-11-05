@@ -570,6 +570,8 @@ class SdkIntegrationTest {
         b.updateGroup(groupId, name = "周六球局", notice = "九点")
         until("renamed") { a.conv(convId)?.name == "周六球局" }
         assertEquals("周六球局", until("convs name") { login(ic).conv(convId) }.name)
+        val noticeTip = until("notice tip") { tipOf(a, "noticeUpdated") ?: tipOf(a, "renamed")?.let { tipOf(a, "noticeUpdated") } }
+        assertEquals("$ib 更新了群公告", tipText(noticeTip.body.tip!!, ia) { it }) // AC-SOC-27-4 的 SDK 部分：全文从 groupInfo 取
         val info = a.getGroupInfo(groupId)
         assertEquals(listOf<Any?>("九点", ib, ia, false), listOf(info.notice, info.noticeBy, info.owner, info.managed))
 

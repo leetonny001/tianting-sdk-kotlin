@@ -204,6 +204,25 @@ class ConnectionTest : SdkTest() {
     }
 
     @Test
+    fun `握手后收不到 auth 的 ack：10 秒后按断线重连，不会一直停在连接中`() {
+        val h = setup()
+        h.connect()
+        val c = h.transport.current
+        c.open()
+        h.clock.advance(9_999)
+        assertEquals(ConnState.CONNECTING, h.im.state.value)
+        h.clock.advance(1)
+        assertEquals(ConnState.DISCONNECTED, h.im.state.value)
+        assertNotNull(c.closedWith)
+        h.clock.advance(1_000)
+        assertEquals(2, h.transport.connections.size)
+        assertEquals(emptyList(), h.fatals())
+        h.login()
+        h.clock.advance(20_000)
+        assertEquals(ConnState.CONNECTED, h.im.state.value) // ack 到了就取消
+    }
+
+    @Test
     fun `旧连接迟到的回调被忽略`() {
         val h = setup()
         h.connect()
@@ -371,6 +390,15 @@ class SendTest : SdkTest() {
         val h = setup()
         val d = h.start { runCatching { send(AB, "x") } }
         assertIs<NotConnectedError>(h.await(d).exceptionOrNull())
+    }
+
+    @Test
+    fun `不合法的会话 ID：发送抛异常，不留下一条永远发送中的消息`() {
+        val (h, c) = online()
+        assertIs<IllegalArgumentException>(h.call { runCatching { send("abc", "x") } }.exceptionOrNull())
+        assertEquals(emptyList(), h.im.messages("abc"))
+        assertEquals(0, h.im.pendingCount.value)
+        assertEquals(0, c.frames("send").size)
     }
 
     @Test

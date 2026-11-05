@@ -79,6 +79,7 @@ internal class Connection(
     private var reconnectTimer: Timer? = null
     private var heartbeatTimer: Timer? = null
     private var pongTimer: Timer? = null
+    private var authTimer: Timer? = null
     private var kickedReason: String? = null
     private var kickedUntil: Long? = null
     private var reqN = 0
@@ -166,6 +167,15 @@ internal class Connection(
                             put("data", buildJsonObject { put("token", token) })
                         }.toString(),
                     )
+                    // 移动网络上握手后可能断在半路：readTimeout 是 0，收不到 auth 的 ack 就一直停在"连接中"。按断线处理。
+                    authTimer = clock.schedule(t.requestTimeoutMs) {
+                        authTimer = null
+                        if (gen != connGen) return@schedule
+                        log.warn("im: auth timeout, reconnecting")
+                        val old = conn
+                        onClosed(1006, "auth timeout")
+                        old?.close(4000, "auth timeout")
+                    }
                 }
 
                 override fun onMessage(text: String) = post { if (gen == connGen) onText(text) }
@@ -214,6 +224,8 @@ internal class Connection(
             }
         }
         if (id != null && id == authId && state == ConnState.CONNECTING) {
+            authTimer?.cancel()
+            authTimer = null
             if (errorBody != null) {
                 log.warn("im: auth rejected ${errorBody.code}")
                 return // 凭证问题由服务端随后的 kicked + 关闭码处理
@@ -305,6 +317,8 @@ internal class Connection(
         conn = null
         heartbeatTimer?.cancel()
         heartbeatTimer = null
+        authTimer?.cancel()
+        authTimer = null
         clearPong()
         val list = pending.values.toList()
         pending.clear()
