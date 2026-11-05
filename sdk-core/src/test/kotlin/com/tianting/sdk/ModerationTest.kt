@@ -1,6 +1,9 @@
 package com.tianting.sdk
 
 import com.tianting.sdk.testing.FakeClock
+import com.tianting.sdk.testing.FakeConnection
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import org.junit.jupiter.api.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -293,8 +296,116 @@ class ModerationTest : SdkTest() {
     fun `不认识的 scope 忽略`() {
         val h = setup()
         val c = online(h)
-        c.receive(muted("scope" to "groupAll", "groupId" to "g1", "mutedUntil" to null))
+        c.receive(muted("scope" to "everyone", "groupId" to "g1", "mutedUntil" to null))
         assertNull(h.mute(G1))
+    }
+
+    // ---- 全群禁言（FE-354、AC-UI-41-6、AC-ADM-42-2）----
+
+    private val all = MuteInfo(MuteScope.GROUP_ALL, "g1", null)
+    private val allEvent = arrayOf<Pair<String, Any?>>("scope" to "groupAll", "groupId" to "g1", "mutedUntil" to null)
+
+    private fun onlineAs(h: Harness, role: String?, allMuted: Boolean = false) = run {
+        h.connect()
+        h.login("alice", listOf(conv(G1, myRole = role, allMuted = allMuted), conv(G2, myRole = "member"), conv(AB)))
+    }
+
+    private fun Harness.denyLastSend(c: FakeConnection) = c.receive(
+        obj("id" to c.last("send")["id"], "cmd" to "ack", "error" to obj("code" to 4031, "msg" to "muted", "details" to obj(*allEvent))),
+    )
+
+    @Test
+    fun `全群禁言：普通成员和没有角色信息时只禁该群；unmuted 解除并发事件`() {
+        for (role in listOf("member", null)) {
+            val h = setup()
+            val c = onlineAs(h, role)
+            val base = h.muteEvents()
+            c.receive(muted(*allEvent))
+            assertEquals(all, h.mute(G1))
+            assertNull(h.mute(G2))
+            assertNull(h.mute(AB))
+            assertEquals(base + 1, h.muteEvents())
+            c.receive(unmuted("scope" to "groupAll", "groupId" to "g2")) // 别的群解除不影响 g1
+            assertEquals(all, h.mute(G1))
+            c.receive(unmuted("scope" to "groupAll", "groupId" to "g1"))
+            assertNull(h.mute(G1))
+            assertEquals(base + 2, h.muteEvents())
+        }
+    }
+
+    @Test
+    fun `全群禁言：群主和管理员不受限，事件和 convs 的 allMuted 都不禁用`() {
+        for (role in listOf("owner", "admin")) {
+            val h = setup()
+            val c = onlineAs(h, role, allMuted = true)
+            assertNull(h.mute(G1))
+            c.receive(muted(*allEvent))
+            assertNull(h.mute(G1))
+        }
+    }
+
+    @Test
+    fun `全群禁言：单独禁言优先，群主被单独禁言仍然禁用`() {
+        val h = setup()
+        val c = onlineAs(h, "owner")
+        c.receive(muted(*allEvent))
+        val until = h.clock.now() + 60_000
+        c.receive(muted("scope" to "group", "groupId" to "g1", "mutedUntil" to until))
+        assertEquals(MuteInfo(MuteScope.GROUP, "g1", until), h.mute(G1))
+        c.receive(unmuted("scope" to "group", "groupId" to "g1"))
+        assertNull(h.mute(G1))
+        c.receive(muted("scope" to "user", "mutedUntil" to null))
+        assertEquals(MuteScope.USER, h.mute(G1)?.scope)
+    }
+
+    @Test
+    fun `全群禁言：convs 的 allMuted 离线开启上线即禁用，下一次 convs 没有时解除`() {
+        val h = setup()
+        val c = onlineAs(h, "member", allMuted = true)
+        assertEquals(all, h.mute(G1))
+        c.drop(1006)
+        val c2 = h.reconnectAuth()
+        c2.ack("convs", obj("convs" to listOf(conv(G1, myRole = "member")), "truncated" to false))
+        assertNull(h.mute(G1))
+    }
+
+    @Test
+    fun `全群禁言：convAdded 带 allMuted 立即禁用，被移出后清除`() {
+        val h = setup()
+        val c = onlineAs(h, "member")
+        c.receive(event("convAdded", "conv" to conv("group:g3", myRole = "member", allMuted = true)))
+        assertEquals(MuteInfo(MuteScope.GROUP_ALL, "g3", null), h.mute("group:g3"))
+        c.receive(event("convRemoved", "convId" to "group:g3", "reason" to "removed"))
+        assertNull(h.mute("group:g3"))
+    }
+
+    @Test
+    fun `全群禁言：发送返回 4031，普通成员显示禁用条，消息标记失败`() {
+        val h = setup()
+        val c = onlineAs(h, "member")
+        h.call { send(G1, "x") } as SendResult.Ok
+        h.denyLastSend(c)
+        assertEquals(all, h.mute(G1))
+        assertEquals(SendError.Code(4031), h.im.messages(G1)[0].error)
+    }
+
+    @Test
+    fun `全群禁言：本地角色过期时 4031 以服务端为准，补拉角色后按新角色判断并通知界面`() {
+        val h = setup()
+        val c = onlineAs(h, "admin")
+        c.receive(muted(*allEvent))
+        assertNull(h.mute(G1))
+        h.call { send(G1, "x") } as SendResult.Ok
+        h.denyLastSend(c)
+        assertEquals(all, h.mute(G1))
+        val info = obj("groupId" to "g1", "name" to "g", "myRole" to "member", "memberCount" to 3, "owner" to "o", "managed" to false, "maxMembers" to 500, "historyVisible" to false, "createdAt" to 1)
+        c.ack("groupInfo", info)
+        assertEquals(all, h.mute(G1))
+        val base = h.muteEvents()
+        c.receive(event("groupChanged", "groupId" to "g1"))
+        c.ack("groupInfo", JsonObject(info + ("myRole" to JsonPrimitive("admin"))))
+        assertNull(h.mute(G1))
+        assertEquals(base + 1, h.muteEvents())
     }
 
     @Test

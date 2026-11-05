@@ -142,7 +142,7 @@ public class IMClient(private val o: IMClientOptions) {
     private val social = SocialState(local)
     private val profiles = ProfileCache { clock.now() }
     private val mutes = MuteTable()
-    private var muteKey = mutes.key()
+    private var muteKey = muteKeyNow()
     private var muteTimer: Timer? = null
 
     @Volatile
@@ -373,8 +373,8 @@ public class IMClient(private val o: IMClientOptions) {
         removed
     }
 
-    /** 这个会话当前的禁言：没有被禁言时为 null。按服务端时间判断到期；用户级优先，群内禁言只影响该群。 */
-    public suspend fun muteState(convId: String): MuteInfo? = onSdk { mutes.get(convId, serverNow()) }
+    /** 这个会话当前的禁言：没有被禁言时为 null。按服务端时间判断到期；用户级优先，群内禁言只影响该群；全群禁言不限制群主、管理员。 */
+    public suspend fun muteState(convId: String): MuteInfo? = onSdk { mutes.get(convId, serverNow(), store.conversation(convId)?.myRole) }
 
     /** 调试接口（AC-ADM-31-3）：导出内存里的会话和全部消息副本（含发送队列）。不包含 token。 */
     public suspend fun debugExport(): DebugExport = onSdk {
@@ -658,7 +658,7 @@ public class IMClient(private val o: IMClientOptions) {
             try {
                 val ack = req("groupCreate", data, GroupCreateAck.serializer())
                 store.upsertConversation(ack.conv)
-                setGroupMute(ack.conv.convId, ack.conv.mutedUntil)
+                setGroupMute(ack.conv.convId, ack.conv.mutedUntil, ack.conv.allMuted)
                 mutesChanged()
                 emitConversations()
                 return@onSdk CreatedGroup(ack.groupId, store.conversation(ack.conv.convId)!!)
@@ -745,6 +745,8 @@ public class IMClient(private val o: IMClientOptions) {
         var changed = false
         changed = store.updateGroupMeta(groupConvId(groupId), info.name, info.memberCount, info.myRole)
         if (changed) emitConversations()
+        mutes.clearGroupAllDenied(groupId)
+        mutesChanged()
         return info
     }
 
@@ -998,7 +1000,7 @@ public class IMClient(private val o: IMClientOptions) {
             "convAdded" -> {
                 val conv = ImJson.decodeFromJsonElement(ServerConversation.serializer(), ev["conv"] ?: return)
                 store.upsertConversation(conv)
-                setGroupMute(conv.convId, conv.mutedUntil)
+                setGroupMute(conv.convId, conv.mutedUntil, conv.allMuted)
                 mutesChanged()
                 emitConversations()
             }
@@ -1081,6 +1083,7 @@ public class IMClient(private val o: IMClientOptions) {
         when {
             scope == "user" -> mutes.setUser(until)
             scope == "group" && groupId != null -> mutes.setGroup(groupId, until)
+            scope == "groupAll" && groupId != null -> mutes.setGroupAll(groupId, until != Deadline.Absent)
             else -> return
         }
         mutesChanged()
@@ -1089,19 +1092,38 @@ public class IMClient(private val o: IMClientOptions) {
     /** 发送返回 4031：按 details 更新状态，界面显示禁用条。这条消息只标记失败，不自动重发。 */
     private fun onMutedAck(details: JsonObject?) {
         details ?: return
+        val groupId = string(details, "groupId")
+        if (string(details, "scope") == "groupAll" && groupId != null) {
+            onGroupAllDenied(groupId)
+            return
+        }
         val until = deadlineOf(details, "mutedUntil") ?: return
         applyMute(string(details, "scope"), string(details, "groupId"), until)
     }
 
-    private fun setGroupMute(convId: String, until: Deadline) {
-        if (convId.startsWith("group:")) mutes.setGroup(convId.removePrefix("group:"), until)
+    /** 全群禁言下发送被拒：以服务端为准显示禁用条。本地角色还是群主 / 管理员说明角色过期了，补拉一次。 */
+    private fun onGroupAllDenied(groupId: String) {
+        mutes.setGroupAll(groupId, true, denied = true)
+        mutesChanged()
+        val role = store.conversation(groupConvId(groupId))?.myRole
+        if (role == GroupRole.OWNER || role == GroupRole.ADMIN) onGroupChanged(groupId)
     }
+
+    private fun setGroupMute(convId: String, until: Deadline, allMuted: Boolean = false) {
+        if (!convId.startsWith("group:")) return
+        val groupId = convId.removePrefix("group:")
+        mutes.setGroup(groupId, until)
+        mutes.setGroupAll(groupId, allMuted)
+    }
+
+    /** 全群禁言是否限制我还取决于我的角色：角色变了也要通知界面。 */
+    private fun muteKeyNow(): String = mutes.key() + mutes.groupAllIds().map { store.conversation(groupConvId(it))?.myRole }
 
     /** 表有变化时发事件，并按最早的到期时间重新定时。 */
     private fun mutesChanged() {
         muteTimer?.cancel()
         muteTimer = null
-        val key = mutes.key()
+        val key = muteKeyNow()
         if (key != muteKey) {
             muteKey = key
             emit(IMEvent.MuteChanged)
@@ -1172,7 +1194,7 @@ public class IMClient(private val o: IMClientOptions) {
         }
         lastRefreshAt = clock.now()
         _truncated.value = store.truncated
-        for (c in ack.convs) setGroupMute(c.convId, c.mutedUntil)
+        for (c in ack.convs) setGroupMute(c.convId, c.mutedUntil, c.allMuted)
         for (id in gone) setGroupMute(id, Deadline.Absent)
         mutesChanged()
         emitConversations()

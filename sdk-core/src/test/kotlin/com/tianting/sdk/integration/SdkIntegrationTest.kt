@@ -808,6 +808,46 @@ class SdkIntegrationTest {
     }
 
     @Test
+    fun `全群禁言：成员禁用 4031，群主和管理员不受限，关闭后恢复，上线从 convs 拿到（AC-ADM-42-1、42-2、AC-UI-41-6）`() = test {
+        val (o, a, m) = Triple(uid("o"), uid("a"), uid("m"))
+        srv.admin("POST", "/admin/users/import", obj("users" to listOf(obj("userId" to o), obj("userId" to a), obj("userId" to m))))
+        val groupId = uid("g")
+        val convId = "group:$groupId"
+        srv.signed("POST", "/admin/groups", obj("groupId" to groupId, "name" to groupId, "members" to listOf(o, a, m), "owner" to o))
+        val owner = login(o)
+        owner.setGroupAdmin(groupId, a, true)
+        val admin = login(a)
+        val member = login(m)
+        until("member sees group") { member.conversations.value.any { it.convId == convId } }
+        until("admin role") { admin.conversations.value.firstOrNull { it.convId == convId }?.myRole == GroupRole.ADMIN }
+        suspend fun sendOk(im: IMClient, text: String) {
+            val r = im.send(convId, text) as SendResult.Ok
+            until(text) { im.messages(convId).firstOrNull { it.clientMsgId == r.message.clientMsgId }?.status == MessageStatus.SENT }
+        }
+
+        srv.signed("POST", "/admin/mute", obj("scope" to "groupAll", "groupId" to groupId, "reason" to "it"))
+        val want = MuteInfo(MuteScope.GROUP_ALL, groupId, null)
+        until("member muted") { member.muteState(convId) }
+        assertEquals(want, member.muteState(convId))
+        assertNull(owner.muteState(convId))
+        assertNull(admin.muteState(convId))
+        sendOk(owner, "owner")
+        sendOk(admin, "admin")
+        val r = member.send(convId, "member") as SendResult.Ok
+        until("4031") { member.messages(convId).firstOrNull { it.clientMsgId == r.message.clientMsgId }?.status == MessageStatus.FAILED }
+        assertEquals(SendError.Code(4031), member.messages(convId).first { it.clientMsgId == r.message.clientMsgId }.error)
+
+        val again = login(m)
+        until("allMuted from convs") { again.muteState(convId) }
+        assertEquals(want, again.muteState(convId))
+
+        srv.signed("POST", "/admin/unmute", obj("scope" to "groupAll", "groupId" to groupId, "reason" to "it"))
+        until("unmuted") { member.muteState(convId) == null }
+        until("unmuted on the second connection") { again.muteState(convId) == null }
+        sendOk(member, "back")
+    }
+
+    @Test
     fun `离线时用户级禁言：auth ack 带 mutedUntil，上线就禁言；永久为 null（AC-ADM-40-6）`() = test {
         val u = uid("u")
         users(u)

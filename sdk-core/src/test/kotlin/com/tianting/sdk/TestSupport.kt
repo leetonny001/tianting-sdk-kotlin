@@ -73,6 +73,7 @@ fun conv(
     updatedAt: Long = 0,
     memberCount: Int? = null,
     myRole: String? = null,
+    allMuted: Boolean = false,
     mutedUntil: Any? = ABSENT,
 ): JsonObject {
     val m = linkedMapOf<String, Any?>(
@@ -88,6 +89,7 @@ fun conv(
     )
     memberCount?.let { m["memberCount"] = it }
     myRole?.let { m["myRole"] = it }
+    if (allMuted) m["allMuted"] = true
     if (mutedUntil != ABSENT) m["mutedUntil"] = mutedUntil
     return js(m).jsonObject
 }

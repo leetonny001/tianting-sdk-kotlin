@@ -142,6 +142,8 @@ internal data class ServerConversation(
     val memberCount: Int? = null,
     val myRole: GroupRole? = null,
     val mutedUntil: Deadline = Deadline.Absent,
+    /** 该群开启了全群禁言时才有（P1，F-ADM-42）；群主、管理员也带，但不受限。 */
+    val allMuted: Boolean = false,
 )
 
 @Serializable
