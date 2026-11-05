@@ -35,6 +35,7 @@ public object ErrorCode {
     public const val TARGET_NOT_GROUP_MEMBER: Int = 4046
     public const val GROUP_EXISTS: Int = 4090
     public const val FRIEND_REQUEST_HANDLED: Int = 4091
+    public const val PUSH_ID_CONFLICT: Int = 4094
     public const val GROUP_MEMBER_LIMIT_EXCEEDED: Int = 4130
     public const val BATCH_LIMIT_EXCEEDED: Int = 4131
     public const val FRIEND_LIMIT_EXCEEDED: Int = 4132
@@ -83,6 +84,7 @@ internal val ERROR_INFO: Map<Int, ErrorInfo> = mapOf(
     4046 to ErrorInfo("TARGET_NOT_GROUP_MEMBER", false, "操作对象不是群成员"),
     4090 to ErrorInfo("GROUP_EXISTS", false, "群 ID 已存在"),
     4091 to ErrorInfo("FRIEND_REQUEST_HANDLED", false, "申请已同意"),
+    4094 to ErrorInfo("PUSH_ID_CONFLICT", false, "同一 pushId 的调用方或内容不同"),
     4130 to ErrorInfo("GROUP_MEMBER_LIMIT_EXCEEDED", false, "群成员已达上限"),
     4131 to ErrorInfo("BATCH_LIMIT_EXCEEDED", false, "单次批量操作数量超限"),
     4132 to ErrorInfo("FRIEND_LIMIT_EXCEEDED", false, "好友数量已达上限"),

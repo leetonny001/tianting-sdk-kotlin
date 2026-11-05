@@ -3,6 +3,7 @@ package com.tianting.sdk.android
 import com.tianting.sdk.IMClient
 import com.tianting.sdk.IMClientOptions
 import com.tianting.sdk.MsgBody
+import com.tianting.sdk.PushCursorState
 import com.tianting.sdk.pinyinGroup
 import com.tianting.sdk.testing.FakeClock
 import com.tianting.sdk.testing.FakeTransport
@@ -12,6 +13,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestCoroutineScheduler
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.serialization.json.Json
 import org.junit.Rule
 import org.junit.Test
@@ -106,5 +108,80 @@ class AndroidAdapterTest {
         // 真机上的用例在 androidTest（AndroidDeviceTest）。这里只验证退化路径不出错。
         assertEquals(if (c == null) "#" else "Z", pinyinGroup("张三", c))
         assertEquals("A", pinyinGroup("Alice", c))
+    }
+
+    @Test
+    fun `AndroidPushCursorStore：按 userId 分键、读回一致、不含内容；文件坏了按没有；不进数据库文件（4_9 节）`() {
+        val dir = tmp.newFolder()
+        val store = AndroidPushCursorStore(dir)
+        assertEquals(null, store.load("u1"))
+        store.save("u1", 41, listOf("p1", "p2"))
+        store.save("../../u2", 7, emptyList())
+        assertEquals(PushCursorState(41, listOf("p1", "p2")), store.load("u1"))
+        assertEquals(PushCursorState(7, emptyList()), store.load("../../u2"))
+        assertEquals(2, dir.listFiles()!!.size, "userId 不进路径")
+        assertTrue(dir.listFiles()!!.none { "u1" in it.name || "u2" in it.name })
+
+        for (f in dir.listFiles()!!) f.writeText("{not json")
+        assertEquals(null, store.load("u1"))
+        for (f in dir.listFiles()!!) f.writeText("""{"cursor":"x","recentIds":[]}""")
+        assertEquals(null, store.load("u1"))
+        for (f in dir.listFiles()!!) f.writeText("""{"cursor":-1,"recentIds":[]}""")
+        assertEquals(null, store.load("u1"))
+        store.save("u1", 42, listOf("p3"))
+        assertEquals(PushCursorState(42, listOf("p3")), store.load("u1"))
+    }
+
+    @Test
+    fun `AC-PUSH-03-16（Android）：游标文件独立于本地库，退出登录清库后新实例按原游标补拉，内容不落进游标文件`() {
+        val dbDir = tmp.newFolder()
+        val pushDir = tmp.newFolder()
+        val scheduler = TestCoroutineScheduler()
+        val dispatcher = StandardTestDispatcher(scheduler)
+        fun client(t: FakeTransport) = IMClient(
+            IMClientOptions(
+                url = "ws://t/ws",
+                database = AndroidLocalDatabase.open(File(dbDir, "im.db")),
+                transport = t,
+                clock = FakeClock(),
+                dispatcher = dispatcher,
+                pushCursorStore = AndroidPushCursorStore(pushDir),
+            ),
+        )
+        val scope = CoroutineScope(UnconfinedTestDispatcher(scheduler) + SupervisorJob())
+        val transport = FakeTransport { scheduler.runCurrent() }
+        val im = client(transport)
+        val got = ArrayList<String>()
+        val job = scope.launch { im.pushes.collect { got.add(it.pushId) } }
+        scheduler.runCurrent()
+        im.connect("t")
+        scheduler.runCurrent()
+        val c = transport.current
+        c.open()
+        c.ack("auth", Json.parseToJsonElement("""{"userId":"alice","serverTime":1}"""))
+        c.ack("pushSync", Json.parseToJsonElement("""{"pushes":[{"pushId":"p41","pushSeq":41,"type":"notice","data":{"text":"$secret"},"ts":5,"target":"user"}],"hasMore":false,"latestSeq":41}"""))
+        assertEquals(listOf("p41"), got)
+        assertEquals(emptyList(), filesContaining(pushDir, secret))
+        assertEquals(1, filesContaining(pushDir, "p41").size)
+        scope.launch { im.disconnect() }
+        scheduler.runCurrent()
+        scope.launch { im.close() }
+        scheduler.runCurrent()
+        job.cancel()
+
+        val t2 = FakeTransport { scheduler.runCurrent() }
+        val im2 = client(t2)
+        scope.launch { im2.pushes.collect { got.add(it.pushId) } }
+        scheduler.runCurrent()
+        im2.connect("t")
+        scheduler.runCurrent()
+        val c2 = t2.current
+        c2.open()
+        c2.ack("auth", Json.parseToJsonElement("""{"userId":"alice","serverTime":9}"""))
+        val data = c2.last("pushSync")["data"].toString()
+        assertEquals("""{"afterSeq":41,"limit":100}""", data)
+        scope.launch { im2.close() }
+        scheduler.runCurrent()
+        scope.coroutineContext[kotlinx.coroutines.Job]!!.cancel()
     }
 }

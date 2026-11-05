@@ -11,6 +11,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -93,6 +94,11 @@ public class IMClientOptions(
     public val isVisible: () -> Boolean = { true },
     /** SDK 的单线程调度器；为 null 时 SDK 自己开一条线程。测试时注入 TestDispatcher。 */
     public val dispatcher: CoroutineDispatcher? = null,
+    /** 本机没有游标时从哪里开始（PRD-live C10）：LATEST 只取最新序号、不回放，灰度首次启动用。已有持久化游标时不生效。 */
+    public val pushStart: PushStart = PushStart.BEGINNING,
+    /** 推送游标的持久化，独立于 database（PRD-live 4.9 节）。为 null 时游标只在内存，每个新实例从 afterSeq=0 开始。 */
+    public val pushCursorStore: PushCursorStore? = null,
+    public val pushLimits: PushLimits = PushLimits(),
 )
 
 /** 缺口超过这么多条时，只加载最新一页，更早的靠向上翻页（C-24）。 */
@@ -242,11 +248,36 @@ public class IMClient(private val o: IMClientOptions) {
         },
     )
 
+    private val _pushSynced = MutableSharedFlow<Long>(extraBufferCapacity = 64, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+    private val pushSync = PushSync(
+        scope = scope,
+        clock = clock,
+        log = log,
+        pushStart = o.pushStart,
+        store = o.pushCursorStore,
+        limits = o.pushLimits,
+        request = { data -> conn.request("pushSync", data) },
+        onSynced = { _pushSynced.tryEmit(it) },
+    )
+
+    /**
+     * 系统推送（PRD-live 4.8 节）。只有这个流的收集者算订阅者：没有收集者时不补拉，带 pushSeq 的帧直接丢弃（之后靠补拉）。
+     * 带 pushSeq 的至少一次，业务按 pushId 幂等；不带的至多一次。收集者处理完一条才交付下一条，一页交付完才前进游标、取下一页。
+     * 收集者抛错只结束它自己，SDK 状态不受影响，重新 collect 可以继续收（F-PUSH-08 规则 2）。
+     */
+    public val pushes: Flow<Push> = pushSync.flow
+
+    /** 一轮补拉结束，值是 max(latestSeq, 本轮已交付的最大 pushSeq)。订阅是可选的，不算 pushes 的订阅者（4.8 节）。 */
+    public val pushSynced: Flow<Long> = _pushSynced.asSharedFlow()
+
     init {
         scope.launch { guard { restore() } }
     }
 
     // ---- 公开接口 ----
+
+    /** 当前的推送游标（已交付的最大连续序号）。没有登录过，或者 pushStart=LATEST 还没拿到最新序号时为 null。 */
+    public fun pushCursor(): Long? = pushSync.cursor
 
     /** 开始连接。token 只放在第一帧 auth 里（C-52）。 */
     public fun connect(token: String) {
@@ -829,6 +860,7 @@ public class IMClient(private val o: IMClientOptions) {
 
     private fun onState(s: ConnState) {
         _state.value = s
+        if (s == ConnState.DISCONNECTED) pushSync.onDisconnected()
         if (s == ConnState.CONNECTED) {
             bannerTimer?.cancel()
             bannerTimer = null
@@ -857,6 +889,7 @@ public class IMClient(private val o: IMClientOptions) {
             if (wipedByFatal) store.persistAll()
         }
         wipedByFatal = false
+        pushSync.onAuth(a.userId, a.serverTime) // 不等 convs、socialSync，互不阻塞（AC-PUSH-03-24）
         store.transaction { social.purgeOldRequests(serverNow()) }
         mutes.setUser(a.mutedUntil) // 没有这个字段表示没有用户级禁言（离线期间可能已经解除）
         mutesChanged()
@@ -948,7 +981,8 @@ public class IMClient(private val o: IMClientOptions) {
                     if (m.seq > 0 && !m.convId.startsWith("room:")) onMessage(m)
                 }
                 "event" -> onEvent(f.data as? JsonObject ?: return)
-                // 不认识的下行命令（push 等二期功能）忽略。
+                "push" -> pushSync.onLive(f.data)
+                // 不认识的下行命令（聊天室等二期功能）忽略（AC-PUSH-01-5）。
             }
         } catch (e: CancellationException) {
             throw e
@@ -1350,6 +1384,7 @@ public class IMClient(private val o: IMClientOptions) {
     }
 
     private fun reset() {
+        pushSync.logout()
         gapTimers.values.forEach { it.cancel() }
         gapTimers.clear()
         readTimer?.cancel()

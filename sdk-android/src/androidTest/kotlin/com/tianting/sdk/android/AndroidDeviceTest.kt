@@ -126,4 +126,15 @@ class AndroidDeviceTest {
             dir.deleteRecursively()
         }
     }
+
+    @Test
+    fun push_cursor_store_uses_the_no_backup_dir_and_survives_a_new_instance() { // PRD-live 4.9 节
+        val dir = java.io.File(ctx.noBackupFilesDir, "tianting-push")
+        dir.deleteRecursively()
+        AndroidPushCursorStore(ctx).save("device-u1", 41, listOf("p1", "p2"))
+        assertEquals(1, dir.listFiles()!!.size)
+        assertEquals(com.tianting.sdk.PushCursorState(41, listOf("p1", "p2")), AndroidPushCursorStore(ctx).load("device-u1"))
+        assertEquals(null, AndroidPushCursorStore(ctx).load("device-u2"))
+        dir.deleteRecursively()
+    }
 }

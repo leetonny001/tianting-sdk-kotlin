@@ -183,7 +183,9 @@ abstract class SdkTest {
         database: LocalDatabase? = null,
         clock: FakeClock = FakeClock(),
         random: () -> Double = { 0.5 }, // 抖动为 0，退避间隔精确
-    ): Harness = Harness(platform, database, clock, random).also { harnesses.add(it) }
+        pushCursorStore: PushCursorStore? = null,
+        pushLimits: PushLimits = PushLimits(),
+    ): Harness = Harness(platform, database, clock, random, pushCursorStore, pushLimits).also { harnesses.add(it) }
 
     @AfterEach
     fun framesMatchSchema() {
@@ -192,7 +194,14 @@ abstract class SdkTest {
 }
 
 @OptIn(ExperimentalCoroutinesApi::class)
-class Harness(platform: Platform, database: LocalDatabase?, val clock: FakeClock, random: () -> Double) {
+class Harness(
+    platform: Platform,
+    database: LocalDatabase?,
+    val clock: FakeClock,
+    random: () -> Double,
+    pushCursorStore: PushCursorStore? = null,
+    pushLimits: PushLimits = PushLimits(),
+) {
     val scheduler = TestCoroutineScheduler()
     private val dispatcher = StandardTestDispatcher(scheduler)
     private val callScope = CoroutineScope(dispatcher + SupervisorJob())
@@ -219,6 +228,8 @@ class Harness(platform: Platform, database: LocalDatabase?, val clock: FakeClock
             },
             isVisible = { visible },
             dispatcher = dispatcher,
+            pushCursorStore = pushCursorStore,
+            pushLimits = pushLimits,
         ),
     )
 

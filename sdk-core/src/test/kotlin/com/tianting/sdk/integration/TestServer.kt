@@ -101,7 +101,7 @@ class TestServer private constructor(private val proc: Process, private val admi
             val dir = Files.createTempDirectory("im-sdk-db-").toFile()
             val callers = File(dir, "callers.json")
             val secret = Base64.getEncoder().encodeToString(CALLER_SECRET.toByteArray())
-            callers.writeText("""[{"id":"$CALLER_ID","alg":"hmac-sha256","secret":"$secret","scopes":["user.ban","msg.delete","mute.write","social.settings","social.friends"]}]""")
+            callers.writeText("""[{"id":"$CALLER_ID","alg":"hmac-sha256","secret":"$secret","scopes":["user.ban","msg.delete","mute.write","social.settings","social.friends","push.user","push.all"],"pushTypes":["notice","promo"]}]""")
             Files.setPosixFilePermissions(callers.toPath(), PosixFilePermissions.fromString("rw-------"))
             val pb = ProcessBuilder(bin.absolutePath)
                 .redirectOutput(ProcessBuilder.Redirect.DISCARD)

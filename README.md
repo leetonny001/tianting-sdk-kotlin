@@ -1,6 +1,6 @@
 # 天听 SDK（Kotlin）
 
-天听 IM 的 Android SDK：网络层与数据层（连接与重连、首帧鉴权、收发、同步、会话、未读、已读、本地缓存、好友与拉黑、群管理、封禁 / 删除 / 禁言），不依赖任何 UI 框架。核心是纯 Kotlin/JVM，可以脱离 Android 跑测试。
+天听 IM 的 Android SDK：网络层与数据层（连接与重连、首帧鉴权、收发、同步、会话、未读、已读、本地缓存、好友与拉黑、群管理、封禁 / 删除 / 禁言、系统推送），不依赖任何 UI 框架。核心是纯 Kotlin/JVM，可以脱离 Android 跑测试。
 
 - 服务端、协议、需求文档：[tianting-server](https://github.com/leetonny001/tianting-server)
 - SDK 设计说明（三套 SDK 的行为基准）：tianting-server 的 `docs/sdk/README.md`
@@ -12,7 +12,7 @@
 |---|---|---|
 | `sdk-core` | 全部逻辑：协议模型、连接、发送队列、同步引擎、已读、社交、群、第二批事件、本地库的 SQL 和事务边界；测试替身 `com.tianting.sdk.testing` | 协程、kotlinx.serialization、OkHttp |
 | `sdk-sqlite-jdbc` | `LocalDatabase` 的 JVM 实现（sqlite-jdbc）：测试、桌面 | sdk-core |
-| `sdk-android` | `AndroidLocalDatabase`（系统 SQLite）、`AndroidPinyin`（android.icu）、`bindNetwork`（网络恢复立即重连） | sdk-core、Android SDK |
+| `sdk-android` | `AndroidLocalDatabase`（系统 SQLite）、`AndroidPushCursorStore`（推送游标文件）、`AndroidPinyin`（android.icu）、`bindNetwork`（网络恢复立即重连） | sdk-core、Android SDK |
 
 没有 Android SDK 的机器上 `sdk-android` 不参与构建，其他模块不受影响。
 
@@ -48,6 +48,7 @@ im.close()                                         // 进程退出前：只释�
 |---|---|
 | 状态流 | `state`、`banner`、`conversations`、`totalUnread`、`pendingCount`、`friends`、`friendRequests`、`blocks`、`socialSettings`、`socialLoaded`、`isOfficial`、`fatal`、`truncated`、`userId`、`messagesFlow(convId)`、`messages(convId)` |
 | 事件 | `events`：`MessagesChanged`、`SendFailed`、`ConvRemoved`、`MuteChanged`、`GroupChanged`、`Fatal` |
+| 系统推送 | `pushes: Flow<Push>`、`pushSynced: Flow<Long>`、`pushCursor()`；选项 `pushStart`、`pushCursorStore`、`pushLimits`（见「系统推送」） |
 | 连接 | `connect`、`disconnect`、`close`、`networkOnline`、`visibilityChanged`、`serverNow` |
 | 消息 / 会话 | `send`、`retry`、`removeFailed`、`loadHistory`、`setActiveConversation`、`refreshConversations`、`conversationSnapshot`、`muteState`、`debugExport` |
 | 社交 | `applyFriend`、`respondFriend`、`deleteFriend`、`setFriendRemark`、`markFriendRequestsSeen`、`relationOf`、`block`、`unblock`、`searchUser`、`setSearchable`、`getUsers`、`profileOf`、`displayName`、`loadMyGroups`、`refreshSocial` |
@@ -56,6 +57,26 @@ im.close()                                         // 进程退出前：只释�
 | 测试替身 | `com.tianting.sdk.testing`：`FakeTransport`、`FakeConnection`、`FakeClock` |
 
 失败的命令抛 `IMError`（`code`、`userId`、`details` 透传）、`TimeoutError`、`NotConnectedError`、`ConnectionClosedError`、`ProtocolDecodeError`。
+
+## 系统推送
+
+规则见 PRD-live 4.3、4.5、4.8、4.9 节，三端一致的判据是 `protocol/vectors/push-sync.json`（71 个用例全部在 `PushVectorsTest` 里跑）。
+
+```kotlin
+val im = IMClient(IMClientOptions(url = url, database = db, pushCursorStore = AndroidPushCursorStore(context)))
+scope.launch { im.pushes.collect { p -> handle(p) } }   // 带 pushSeq 的至少一次，按 pushId 幂等
+scope.launch { im.pushSynced.collect { latestSeq -> … } } // 可选，不算订阅者
+im.connect(token)
+```
+
+| 规则 | 说明 |
+|---|---|
+| 订阅者 | 只算 `pushes` 的收集者。没有收集者时不发 `pushSync`，带 `pushSeq` 的帧丢弃（之后补拉），不带的进上限 500 的队列 |
+| 交付 | `onFrame` 不挂起。帧、ack、定时器、注册进同一条串行队列，由单独的协程按序处理；收集者处理完一条才交付下一条，一页交付完才前进游标、取下一页，SDK 线程不被占住 |
+| 收集者跟不上 | 队列有界：带 `pushSeq` 的超过 200 条丢弃、空闲后补拉一轮；不带的超过 500 条丢最旧。收集者永远不返回时推送停在那里（其他功能不受影响），退出登录能打断 |
+| 收集者抛错 | 只结束它自己，其他收集者继续，重新 `collect` 可以继续收 |
+| 持久化 | `PushCursorStore` 独立于 `database`，互不依赖：退出、被踢、库重建、Schema 升级都不清，只存游标和最近 2000 个 `pushId`，一个事件处理完落盘一次。**没有注入时游标只在内存**，每个新实例从 `afterSeq=0` 回放，和 H5 相同；`database` 为 null 不影响 |
+| 日志 | SDK 不写 `data`，`Push.toString()` 也不带它 |
 
 ## 本地持久化
 
@@ -99,10 +120,10 @@ scripts/sync-protocol.sh       # 默认从同级目录 ../tianting-server（或 
 
 ## 集成测试
 
-集成测试会编译并启动真实的服务端（测试模式，`IM_V13_ADMIN_FEATURES=1`），需要 Go 1.27+ 和 tianting-server 的源码：
+集成测试会编译并启动真实的服务端（测试模式，`IM_V13_ADMIN_FEATURES=1`，推送用例另加 `IM_PUSH_ENABLED=1`），需要 Go 1.27+ 和 tianting-server 的源码：
 
 ```bash
-./gradlew :sdk-core:integrationTest   # 默认找同级目录 ../tianting-server/server 或 ../im-mvp/server
+./gradlew :sdk-core:integrationTest   # 含 PushIntegrationTest（IM_PUSH_ENABLED=1，另起一个关闭开关的服务端验 4001）。默认找同级目录 ../tianting-server/server 或 ../im-mvp/server
 TIANTING_SERVER_DIR=/path/to/tianting-server/server ./gradlew :sdk-core:integrationTest
 ```
 
