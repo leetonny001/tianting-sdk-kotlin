@@ -223,8 +223,9 @@ public fun tipText(tip: TipBody, me: String, nameOf: (String) -> String): String
         "joined" -> if (you) "你邀请 $targets 加入了群聊" else "$actor 邀请 $targets 加入了群聊"
         "ownerChanged" -> when {
             tip.actor.isNotEmpty() -> "${spaced}将群主转让给 $targets"
-            tip.targets.isNotEmpty() -> "$targets 已成为群主"
-            else -> "群主已退出群聊"
+            tip.targets.isEmpty() -> "群主已退出群聊"
+            targets == "你" -> "你已成为群主"
+            else -> "$targets 已成为群主"
         }
         "adminSet" -> "${spaced}将 $targets 设为管理员"
         "adminUnset" -> "${spaced}取消了 $targets 的管理员"
