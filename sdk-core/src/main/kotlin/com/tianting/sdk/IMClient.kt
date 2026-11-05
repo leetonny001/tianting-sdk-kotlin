@@ -330,6 +330,18 @@ public class IMClient(private val o: IMClientOptions) {
         }
     }
 
+    /**
+     * 从本地移除一条失败的消息（PRD-ui G-UI-14）：不发任何帧，不影响服务端。只对失败状态有效，否则不动并返回 false。
+     * 移除后 pendingCount 减 1；之后晚到的 ack、sync 不会让它再出现，冷启动后也不会（退出登录、被踢清库时这个记录一起清掉）。
+     */
+    public suspend fun removeFailed(convId: String, clientMsgId: String): Boolean = onSdk {
+        val list = store.listIfExists(convId) ?: return@onSdk false
+        var removed = false
+        store.transaction { removed = list.removeFailed(clientMsgId) }
+        if (removed) emitMessages(convId)
+        removed
+    }
+
     /** 这个会话当前的禁言：没有被禁言时为 null。按服务端时间判断到期；用户级优先，群内禁言只影响该群。 */
     public suspend fun muteState(convId: String): MuteInfo? = onSdk { mutes.get(convId, serverNow()) }
 
@@ -786,7 +798,7 @@ public class IMClient(private val o: IMClientOptions) {
             self = owner
             _userId.value = owner
             for ((view, base, placeholder) in r.conversations) store.restoreConversation(view, base, placeholder)
-            for ((convId, refs) in r.deletedRefs) store.list(convId).restoreDeletedRefs(refs.first, refs.second)
+            for ((convId, refs) in r.deletedRefs) store.list(convId).restoreRefs(refs)
             // 上次进程结束时还没发出去的消息：标记失败，由用户决定是否重发（不在用户不知情时发出旧消息）。
             val unsentToFail = ArrayList<Message>()
             for (m in r.messages) {

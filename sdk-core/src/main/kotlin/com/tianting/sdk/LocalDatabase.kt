@@ -22,12 +22,19 @@ private const val SCHEMA_VERSION = 1L
 /** 冷启动时每个会话最多恢复多少条消息，更早的从库里删掉，靠向上翻页。 */
 internal const val RESTORE_LIMIT_PER_CONV = 200
 
+/** 一个会话记下的"不能再写回来"的消息。 */
+internal class DeletedRefs(
+    val ids: MutableSet<String> = HashSet(),
+    val seqs: MutableSet<Long> = HashSet(),
+    val removedClient: MutableSet<String> = HashSet(),
+)
+
 /** 从本地库恢复出来的全部状态。 */
 internal class RestoredState(
     val owner: String?,
     val conversations: List<Triple<Conversation, Long, Boolean>>,
     val messages: List<Message>,
-    val deletedRefs: Map<String, Pair<Set<String>, Set<Long>>>,
+    val deletedRefs: Map<String, DeletedRefs>,
     val socialVer: Long,
     val requestSeenVer: Long,
     val settings: SocialSettings,
@@ -220,6 +227,11 @@ internal class LocalDb(private val db: LocalDatabase, private val log: Logger) :
         for (s in seqs) db.execute("INSERT OR IGNORE INTO deleted_refs(conv_id, kind, ref) VALUES(?, 'seq', ?)", listOf(convId, s.toString()))
     }
 
+    /** removeFailed 删过的 clientMsgId。 */
+    override fun addRemovedClient(convId: String, clientMsgIds: Collection<String>) = guarded {
+        for (id in clientMsgIds) db.execute("INSERT OR IGNORE INTO deleted_refs(conv_id, kind, ref) VALUES(?, 'client', ?)", listOf(convId, id))
+    }
+
     // ---- 社交 ----
 
     override fun upsertFriend(f: FriendItem) = guarded {
@@ -297,10 +309,14 @@ internal class LocalDb(private val db: LocalDatabase, private val log: Logger) :
             }
             flushDeleted()
         }
-        val refs = HashMap<String, Pair<MutableSet<String>, MutableSet<Long>>>()
+        val refs = HashMap<String, DeletedRefs>()
         for (r in db.query("SELECT conv_id, kind, ref FROM deleted_refs")) {
-            val e = refs.getOrPut(r["conv_id"] as String) { mutableSetOf<String>() to mutableSetOf() }
-            if (r["kind"] == "id") e.first.add(r["ref"] as String) else e.second.add((r["ref"] as String).toLong())
+            val e = refs.getOrPut(r["conv_id"] as String) { DeletedRefs() }
+            when (r["kind"]) {
+                "id" -> e.ids.add(r["ref"] as String)
+                "seq" -> e.seqs.add((r["ref"] as String).toLong())
+                "client" -> e.removedClient.add(r["ref"] as String)
+            }
         }
         val meta = db.query("SELECT social_ver, request_seen_ver, settings, official, loaded FROM social_meta").firstOrNull()
         return RestoredState(

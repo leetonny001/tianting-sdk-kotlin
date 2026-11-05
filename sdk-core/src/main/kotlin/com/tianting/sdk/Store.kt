@@ -99,6 +99,7 @@ internal interface StoreSink {
     fun clearServerMessages(convId: String)
     fun wipeMessage(m: Message)
     fun addDeletedRefs(convId: String, msgIds: Collection<String>, seqs: Collection<Long>)
+    fun addRemovedClient(convId: String, clientMsgIds: Collection<String>)
     fun <T> transaction(block: () -> T): T
 }
 
@@ -111,6 +112,7 @@ internal object NoStoreSink : StoreSink {
     override fun clearServerMessages(convId: String) = Unit
     override fun wipeMessage(m: Message) = Unit
     override fun addDeletedRefs(convId: String, msgIds: Collection<String>, seqs: Collection<Long>) = Unit
+    override fun addRemovedClient(convId: String, clientMsgIds: Collection<String>) = Unit
     override fun <T> transaction(block: () -> T): T = block()
 }
 
@@ -120,7 +122,7 @@ private const val SUMMARY_LEN = 100
 private fun deletedLast(msgId: String, from: String, type: MsgType, ts: Long) = LastMsg(msgId, from, type, null, ts, deleted = true)
 
 /** 一个会话的消息：有 seq 的按 seq 升序，没有 seq 的（待发 / 失败）按发送顺序排在最后（F-MSG-03 规则 3）。 */
-internal class MessageList(private val convId: String, private val sinkOf: (String) -> StoreSink) {
+internal class MessageList(private val convId: String, private val self: () -> String, private val sinkOf: (String) -> StoreSink) {
     private val bySeq = HashMap<Long, Message>()
     private val unsent = ArrayList<Message>()
     private val byClient = HashMap<String, Message>()
@@ -129,6 +131,10 @@ internal class MessageList(private val convId: String, private val sinkOf: (Stri
     // 已知被删除的 msgId / seq：之后才到的 sync 结果、发送 ack 带着原文也不能写回来。
     private val deletedIds = HashSet<String>()
     private val deletedSeqs = HashSet<Long>()
+
+    // 本地删除过的失败消息（G-UI-14）：它可能其实到了服务端，之后的 ack、sync 不能让它再出现。
+    // 只认自己发的：clientMsgId 对同群成员可见，别人用同一个值发的消息不能被藏起来。
+    private val removedClient = HashSet<String>()
 
     /** 已加载的最早 seq（用于向前翻页）；0 表示还没加载过。 */
     var oldestSeq = 0L
@@ -143,6 +149,7 @@ internal class MessageList(private val convId: String, private val sinkOf: (Stri
      * 已有的消息只会变成已删除。返回合并后的消息，没有变化时为 null。
      */
     fun addServer(m: ServerMessage): Message? {
+        if (m.clientMsgId in removedClient && m.from == self()) return null
         val deleted = m.deleted || isDeleted(m.msgId, m.seq)
         if (m.msgId in byMsgId) {
             val old = bySeq[m.seq]
@@ -213,6 +220,18 @@ internal class MessageList(private val convId: String, private val sinkOf: (Stri
 
     fun local(clientMsgId: String): Message? = byClient[clientMsgId]
 
+    /** 移除一条失败的本地消息，并记住它的 clientMsgId（本地库里也记，冷启动后同样不会复活）。不是失败状态时不动，返回 false。 */
+    fun removeFailed(clientMsgId: String): Boolean {
+        val m = byClient[clientMsgId] ?: return false
+        if (m.status != MessageStatus.FAILED || m.seq != null) return false
+        unsent.remove(m)
+        byClient.remove(clientMsgId)
+        removedClient.add(clientMsgId)
+        sink.deleteUnsent(convId, clientMsgId)
+        sink.addRemovedClient(convId, listOf(clientMsgId))
+        return true
+    }
+
     fun has(seq: Long): Boolean = seq in bySeq
 
     /** 更新本地消息（状态变化）；返回新对象，旧对象保持不变，方便界面按引用比较。 */
@@ -250,6 +269,7 @@ internal class MessageList(private val convId: String, private val sinkOf: (Stri
         for (m in bySeq.values) if (m.deleted) sink.wipeMessage(m) else sink.upsertMessage(m)
         for (m in unsent) sink.upsertMessage(m)
         sink.addDeletedRefs(convId, deletedIds, deletedSeqs)
+        sink.addRemovedClient(convId, removedClient)
     }
 
     // ---- 冷启动恢复：只改内存，不再写回本地库 ----
@@ -265,9 +285,10 @@ internal class MessageList(private val convId: String, private val sinkOf: (Stri
         byClient[m.clientMsgId] = m
     }
 
-    fun restoreDeletedRefs(ids: Collection<String>, seqs: Collection<Long>) {
-        deletedIds.addAll(ids)
-        deletedSeqs.addAll(seqs)
+    fun restoreRefs(refs: DeletedRefs) {
+        deletedIds.addAll(refs.ids)
+        deletedSeqs.addAll(refs.seqs)
+        removedClient.addAll(refs.removedClient)
     }
 }
 
@@ -395,7 +416,7 @@ internal class Store(private val self: () -> String, private val sink: StoreSink
 
     // ---- 消息 ----
 
-    fun list(convId: String): MessageList = msgs.getOrPut(convId) { MessageList(convId, sinkFor) }
+    fun list(convId: String): MessageList = msgs.getOrPut(convId) { MessageList(convId, self, sinkFor) }
 
     fun listIfExists(convId: String): MessageList? = msgs[convId]
 

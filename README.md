@@ -49,7 +49,7 @@ im.close()                                         // 进程退出前：只释�
 | 状态流 | `state`、`banner`、`conversations`、`totalUnread`、`pendingCount`、`friends`、`friendRequests`、`blocks`、`socialSettings`、`socialLoaded`、`isOfficial`、`fatal`、`truncated`、`userId`、`messagesFlow(convId)`、`messages(convId)` |
 | 事件 | `events`：`MessagesChanged`、`SendFailed`、`ConvRemoved`、`MuteChanged`、`GroupChanged`、`Fatal` |
 | 连接 | `connect`、`disconnect`、`close`、`networkOnline`、`visibilityChanged`、`serverNow` |
-| 消息 / 会话 | `send`、`retry`、`loadHistory`、`setActiveConversation`、`refreshConversations`、`conversationSnapshot`、`muteState`、`debugExport` |
+| 消息 / 会话 | `send`、`retry`、`removeFailed`、`loadHistory`、`setActiveConversation`、`refreshConversations`、`conversationSnapshot`、`muteState`、`debugExport` |
 | 社交 | `applyFriend`、`respondFriend`、`deleteFriend`、`setFriendRemark`、`markFriendRequestsSeen`、`relationOf`、`block`、`unblock`、`searchUser`、`setSearchable`、`getUsers`、`profileOf`、`displayName`、`loadMyGroups`、`refreshSocial` |
 | 群 | `createGroup`、`inviteToGroup`、`leaveGroup`、`kickFromGroup`、`transferGroupOwner`、`setGroupAdmin`、`dissolveGroup`、`updateGroup`、`getGroupInfo`、`loadGroupMembers` |
 | 工具 | `c2cConvId`、`groupConvId`、`parseConvIdStrict`、`peerId`、`checkText`、`trimText`、`countCodePoints`、`describeError`、`messageFor`、`tipText`、`ErrorCode`、`CloseCode`、`avatarColorIndex`、`avatarInitial`、`fnv1a32`、`pinyinGroup`、`groupByPinyin`、`compareNames` |
@@ -71,6 +71,8 @@ im.close()                                         // 进程退出前：只释�
 | 被踢 / 退出登录 / 换账号：清库 | FE-131 |
 | 冷启动：恢复会话、消息（每个会话最新 200 条，更早的删掉靠翻页）、社交状态；连上后从持久化的 ver 增量同步，并重新拉已加载的范围（离线期间的删除） | F-SOC-06 规则 10、F-ADM-31 规则 5 |
 | 上次进程结束时还没发出去的消息：恢复为失败，不自动发出，可以手动重发（沿用原 `clientMsgId`） | 实现约定 |
+
+`removeFailed(convId, clientMsgId)`（G-UI-14）：只对失败的消息有效，不发帧，`pendingCount` 减 1；正文从本地库清掉，并记下 `clientMsgId`，晚到的 ack、sync 和冷启动都不会让它再出现。
 
 token 不进本地库。数据库文件放在应用私有目录。
 

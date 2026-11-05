@@ -374,6 +374,73 @@ class PersistenceTest : SdkTest() {
     }
 
     @Test
+    fun `removeFailed：本地库的正文清掉；冷启动后不复活，ack 丢了的那条经 sync 回来也不复活（G-UI-14）`() {
+        val h = open()
+        h.connect()
+        val c = h.login("alice", listOf(conv(AB)))
+        h.call { send(AB, SECRET) }
+        h.clock.advance(10_000)
+        assertPresent()
+        assertTrue(h.call { removeFailed(AB, "cid-0001") })
+        assertClean()
+        c.ack("send", obj("msgId" to "m1", "convId" to AB, "seq" to 1, "ts" to 1))
+        assertClean()
+        h.closeDb()
+
+        val h2 = open()
+        assertEquals(emptyList(), h2.im.messages(AB))
+        assertEquals(0, h2.im.pendingCount.value)
+        h2.connect()
+        val c2 = h2.login("alice", listOf(conv(AB, maxSeq = 2)))
+        val p = h2.start { loadHistory(AB) }
+        val mine = obj(*msg(AB, 1, "alice", SECRET).entries.map { it.key to it.value }.toTypedArray(), "clientMsgId" to "cid-0001")
+        c2.ack("sync", obj("messages" to listOf(mine, msg(AB, 2)), "hasMore" to false))
+        h2.await(p)
+        assertEquals(listOf(2L), h2.im.messages(AB).map { it.seq })
+        assertClean()
+    }
+
+    @Test
+    fun `冷启动恢复成失败的消息也能 removeFailed，再次重启不复活`() {
+        val h = open()
+        h.connect()
+        val c = h.login("alice", listOf(conv(AB)))
+        c.drop(1006)
+        h.call { send(AB, SECRET) }
+        h.closeDb()
+        val h2 = open()
+        assertEquals(MessageStatus.FAILED, h2.im.messages(AB)[0].status)
+        assertTrue(h2.call { removeFailed(AB, "cid-0001") })
+        assertClean()
+        h2.closeDb()
+        val h3 = open()
+        assertEquals(emptyList(), h3.im.messages(AB))
+        assertEquals(0, h3.im.pendingCount.value)
+    }
+
+    @Test
+    fun `removeFailed 后被踢、同一账号重新登录：记录写回本地库，再重启也不复活`() {
+        val h = open()
+        h.connect()
+        val c = h.login("alice", listOf(conv(AB)))
+        h.call { send(AB, SECRET) }
+        h.clock.advance(10_000)
+        h.call { removeFailed(AB, "cid-0001") }
+        c.receive(event("kicked", "reason" to "tokenExpired"))
+        c.drop(4011)
+        h.connect("t2")
+        h.login("alice", listOf(conv(AB)))
+        h.closeDb()
+        val h2 = open()
+        h2.connect()
+        val c2 = h2.login("alice", listOf(conv(AB, maxSeq = 1)))
+        val p = h2.start { loadHistory(AB) }
+        c2.ack("sync", obj("messages" to listOf(obj(*msg(AB, 1, "alice", SECRET).entries.map { it.key to it.value }.toTypedArray(), "clientMsgId" to "cid-0001")), "hasMore" to false))
+        h2.await(p)
+        assertEquals(emptyList(), h2.im.messages(AB))
+    }
+
+    @Test
     fun `离线时可以用恢复出来的身份发送（排队）`() {
         val h = open()
         h.connect()

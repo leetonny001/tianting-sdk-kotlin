@@ -362,6 +362,67 @@ class SendTest : SdkTest() {
     }
 
     @Test
+    fun `removeFailed：只移除失败的消息，pendingCount 减 1，不发帧，之后重发无效（AC-UI-09-5、G-UI-14）`() {
+        val (h, c) = online()
+        h.call { send(AB, "sent one") }
+        c.ack("send", obj("msgId" to "m1", "convId" to AB, "seq" to 1, "ts" to 1))
+        h.call { send(AB, "fails") }
+        h.clock.advance(10_000)
+        assertEquals(listOf("cid-0001:sent#1", "cid-0002:failed(timeout)"), h.status(AB))
+        assertEquals(1, h.im.pendingCount.value)
+        val frames = c.frames().size
+
+        assertFalse(h.call { removeFailed(AB, "cid-0001") }) // sent 不动
+        assertFalse(h.call { removeFailed(AB, "nope") })
+        assertFalse(h.call { removeFailed("c2c:alice:nobody", "cid-0002") })
+        assertEquals(listOf("cid-0001:sent#1", "cid-0002:failed(timeout)"), h.status(AB))
+
+        assertTrue(h.call { removeFailed(AB, "cid-0002") })
+        assertEquals(listOf("cid-0001:sent#1"), h.status(AB))
+        assertEquals(0, h.im.pendingCount.value)
+        assertFalse(h.call { removeFailed(AB, "cid-0002") })
+        h.call { retry(AB, "cid-0002") }
+        assertEquals(frames, c.frames().size)
+        assertEquals(listOf("cid-0001:sent#1"), h.status(AB))
+    }
+
+    @Test
+    fun `removeFailed：发送中和排队的消息不能移除`() {
+        val (h, c) = online()
+        h.call { send(AB, "sending") }
+        assertFalse(h.call { removeFailed(AB, "cid-0001") })
+        assertEquals(listOf("cid-0001:sending"), h.status(AB))
+        c.drop(1006)
+        h.call { send(AB, "queued") }
+        assertFalse(h.call { removeFailed(AB, "cid-0002") })
+        assertEquals(MessageStatus.QUEUED, h.im.messages(AB).first { it.clientMsgId == "cid-0002" }.status)
+    }
+
+    @Test
+    fun `removeFailed 之后，晚到的 ack 和 sync 都不能让它再出现，内存里也没有原文（AC-UI-09-5）`() {
+        val (h, c) = online()
+        h.call { send(AB, "SECRET-REMOVED") }
+        h.clock.advance(10_000)
+        h.call { removeFailed(AB, "cid-0001") }
+        c.ack("send", obj("msgId" to "m1", "convId" to AB, "seq" to 1, "ts" to 1)) // 超时后 ack 才到
+        assertEquals(emptyList(), h.im.messages(AB))
+        c.receive(msgFrame(obj(*msg(AB, 1, "alice", "SECRET-REMOVED").entries.map { it.key to it.value }.toTypedArray(), "clientMsgId" to "cid-0001")))
+        assertEquals(emptyList(), h.im.messages(AB))
+        assertEquals(0, h.im.pendingCount.value)
+        assertFalse(holds(h.im, "SECRET-REMOVED"))
+    }
+
+    @Test
+    fun `removeFailed 只拦自己的消息：别人用同一个 clientMsgId 发的照常显示`() {
+        val (h, c) = online(listOf(conv(G)))
+        h.call { send(G, "x") }
+        h.clock.advance(10_000)
+        h.call { removeFailed(G, "cid-0001") }
+        c.receive(msgFrame(obj(*msg(G, 1, "bob", "hi").entries.map { it.key to it.value }.toTypedArray(), "clientMsgId" to "cid-0001")))
+        assertEquals(listOf("hi"), h.im.messages(G).map { it.body.text })
+    }
+
+    @Test
     fun `被踢时发送中和排队的消息全部标记失败（AC-AUTH-03-6），包括还不在会话列表里的新会话`() {
         val (h, c) = online(listOf(conv(AB)))
         h.call { send(AB, "a") }

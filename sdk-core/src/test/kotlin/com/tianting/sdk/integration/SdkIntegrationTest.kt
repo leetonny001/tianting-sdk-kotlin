@@ -210,6 +210,34 @@ class SdkIntegrationTest {
     }
 
     @Test
+    fun `removeFailed：ack 丢了的消息本地删除后，真实 sync 带回来也不复活；冷启动后同样（AC-UI-09-5）`() = test {
+        val (a, b) = uid("alice") to uid("bob")
+        users(b)
+        val id = uid("removed-")
+        val dbDir = Files.createTempDirectory("im-sdk-it-removed").toFile()
+        val alice = login(a, client(timings = IMClientTimings(sendTimeoutMs = 800), database = JdbcLocalDatabase(File(dbDir, "im.db")), newId = { id }))
+        val bob = login(b)
+        val conv = c2cConvId(a, b)
+        srv.admin("POST", "/admin/test/drop-ack", obj("clientMsgId" to id))
+        alice.send(conv, "SECRET-REMOVED-IT")
+        until("bob receives") { bob.messages(conv).firstOrNull() }
+        until("times out") { alice.messages(conv).firstOrNull()?.status == MessageStatus.FAILED }
+        assertTrue(alice.removeFailed(conv, id))
+        assertEquals(emptyList(), alice.messages(conv))
+        bob.send(conv, "tail")
+        until("tail") { alice.messages(conv).any { it.body.text == "tail" } }
+        alice.close()
+        clients.remove(alice)
+        assertEquals(emptyList(), filesContaining(dbDir, "SECRET-REMOVED-IT"))
+
+        val again = login(a, client(database = JdbcLocalDatabase(File(dbDir, "im.db"))))
+        until("convs") { again.conv(conv) }
+        delay(300) // 连上后 recheckDeleted 重新拉已加载的范围，seq 1 会回来
+        assertEquals(listOf("tail"), again.messages(conv).map { it.body.text })
+        assertEquals(0, again.pendingCount.value)
+    }
+
+    @Test
     fun `被拉进群收到 convAdded；群消息多端同步`() = test {
         val (a, c) = uid("alice") to uid("carol")
         val alice = login(a)
