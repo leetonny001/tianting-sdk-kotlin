@@ -119,6 +119,23 @@ class PersistenceTest : SdkTest() {
     }
 
     @Test
+    fun `还没加载过的消息的墓碑也持久化：重启后 sync 带着原文也写不回来`() {
+        val h = open()
+        h.connect()
+        val c = h.login("alice", listOf(conv(G1, maxSeq = 9)))
+        c.receive(event("msgDeleted", "convId" to G1, "msgIds" to listOf("$G1#9"), "seqs" to listOf(9)))
+        h.closeDb()
+        val h2 = open()
+        h2.connect()
+        val c2 = h2.login("alice", listOf(conv(G1, maxSeq = 9)))
+        val p = h2.start { loadHistory(G1) }
+        c2.ack("sync", obj("messages" to listOf(msg(G1, 9, "bob", SECRET)), "hasMore" to false))
+        h2.await(p)
+        assertEquals(true, h2.im.messages(G1)[0].deleted)
+        assertClean()
+    }
+
+    @Test
     fun `离线期间被删除：冷启动后重连，重新拉已加载范围，本地库的原文被清掉`() {
         val h = open()
         h.connect()
@@ -220,6 +237,8 @@ class PersistenceTest : SdkTest() {
         assertClean("REMARK-777")
         assertEquals(SendError.Kicked, h.im.messages(AB)[0].error)
         assertEquals(1, h.im.pendingCount.value)
+        h.call { retry(AB, "cid-0001") } // 被踢之后的状态变化只改内存，不写库
+        assertClean()
         h.connect("t2")
         val c2 = h.transport.current
         c2.open()

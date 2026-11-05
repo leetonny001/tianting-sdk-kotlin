@@ -77,6 +77,20 @@ class SocialTest : SdkTest() {
     }
 
     @Test
+    fun `restart：丢掉本轮已收到的页，用同一个 sinceVer 重新开始（F-SOC-06 规则 8）`() {
+        val (h, c) = loggedIn()
+        c.ack("socialSync", page(untilVer = 5))
+        c.receive(event("socialChanged", "ver" to 6))
+        h.clock.advance(200)
+        c.ack("socialSync", page(untilVer = 6, hasMore = true, cursor = "c1", friends = listOf(friend("stale", 6))))
+        assertEquals(obj("cursor" to "c1", "limit" to 500), c.last("socialSync").dataObj)
+        c.ack("socialSync", obj("restart" to true, "hasMore" to true, "cursor" to "c2"))
+        assertEquals(obj("sinceVer" to 5, "limit" to 500), c.last("socialSync").dataObj)
+        c.ack("socialSync", page(untilVer = 7, friends = listOf(friend("fresh", 7))))
+        assertEquals(listOf("fresh"), h.im.friends.value.map { it.userId })
+    }
+
+    @Test
     fun `失败的命令抛出带错误码的 IMError`() {
         val (h, c) = loggedIn()
         val p = h.start { runCatching { respondFriend("carol", FriendAction.ACCEPT) } }

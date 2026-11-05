@@ -431,6 +431,7 @@ class ModerationTest : SdkTest() {
         val c = online(h)
         c.receive(muted("scope" to "group", "groupId" to "g1", "mutedUntil" to null))
         c.receive(event("convRemoved", "convId" to G1, "reason" to "removed"))
+        assertNull(h.mute(G1))
         c.receive(event("convAdded", "conv" to conv(G1)))
         assertNull(h.mute(G1))
         c.receive(muted("scope" to "user", "mutedUntil" to null))
