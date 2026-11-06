@@ -183,7 +183,7 @@ class AccountPendingLogoutTest : AccountTest() {
     }
 
     @Test
-    fun `TC-ACC-04-06 恢复码没确认时退出：确认前 token 只放内存，请求成功就不落盘，断网才写待退出（问题 14）`() {
+    fun `TC-ACC-04-06 恢复码没确认时退出：确认前 token 只放内存，请求成功就不落盘，断网才写待退出（frontend-chat 问题 K1）`() {
         val a = setupAccount()
         val login = a.start { login(USER, "Password-1") }
         a.http.last("/v1/account/login").respond(200, authBody(1, a.clock.now() + DAY, recoveryCode = "C", recoveryCodeGen = 1))
