@@ -1483,12 +1483,14 @@ class AccountSessionTest : AccountTest() {
     }
 
     @Test
-    fun `TC-ACC-02-13 服务端发的四种 kind 都放行（AC-ACC-03-25、AC-ACC-03-45，F-ACC-05 规则 5）`() {
+    fun `TC-ACC-02-13 服务端发的七种 kind 都放行，不认识的不放行（AC-ACC-03-25、AC-ACC-03-45，F-ACC-05 规则 5）`() {
         val a = setupAccount()
         a.session(1, DAY)
         val c = a.online()
-        val kinds = listOf("newDeviceLogin", "recoveryCodeRegenerated", "refreshReplay", "refreshRateLimited")
-        for (k in kinds + listOf("newIpPrefix", "")) c.receive(event("securityNotice", "kind" to k, "at" to 1, "platform" to "ios"))
+        val kinds = listOf(
+            "newDeviceLogin", "passwordChanged", "passwordRecovered", "recoveryCodeRegenerated", "refreshReplay", "refreshRateLimited", "newIpPrefix",
+        )
+        for (k in kinds + listOf("futureKind", "")) c.receive(event("securityNotice", "kind" to k, "at" to 1, "platform" to "ios"))
         assertEquals(kinds, a.h.events.filterIsInstance<IMEvent.SecurityNotice>().map { it.kind })
     }
 

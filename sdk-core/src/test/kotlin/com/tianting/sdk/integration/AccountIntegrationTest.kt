@@ -399,6 +399,9 @@ class AccountIntegrationTest {
         val f = d2.fatal.single() as FatalReason.Kicked
         assertEquals("passwordChanged" to 4012, f.reason to f.code)
         assertTrue(f.recoverBefore!! > System.currentTimeMillis())
+        // F-ACC-05 规则 5：其他设备先收到提醒，发起的设备收不到（问题表 A13、A14）。
+        assertEquals(listOf("passwordChanged"), d2.events.filterIsInstance<IMEvent.SecurityNotice>().map { it.kind })
+        assertEquals(emptyList(), d1.events.filterIsInstance<IMEvent.SecurityNotice>().map { it.kind })
         assertEquals(SessionDialog.RECOVER_BEFORE, d2.ended.single().dialog)
         assertEquals(f.recoverBefore, d2.ended.single().recoverBefore)
         assertNull(d2.session)
