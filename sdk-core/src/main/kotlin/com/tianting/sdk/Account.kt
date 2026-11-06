@@ -325,6 +325,9 @@ public class AccountClient(private val o: AccountClientOptions) {
     private val queue = ArrayDeque<() -> Unit>()
     private var refreshQueued = false
     private var epoch = 0 // 每次会话结束加一：进行中的操作回来时，响应不能把已经退出的会话救回来
+    private var sessionSeq = 0 // 每个新会话（登录、注册、找回、restore）加一：logout 只收尾它开始时的那个会话（问题 A1）
+    private var logoutSeq = 0 // 每次 logout 加一：logout 之前发出的登录，响应不再采用（退出优先）
+    private val logoutHolds = HashSet<Any>() // 进行中的 logout 占的 holdDepth：新会话建立时一起放掉
 
     private var holdDepth = 0 // 换 sid 的操作进行中（F-ACC-04 规则 3）
     private var heldKicks = ArrayList<Pair<KickInfo, CompletableDeferred<KickDecision>>>()
@@ -424,11 +427,14 @@ public class AccountClient(private val o: AccountClientOptions) {
     public suspend fun restore(saved: AccountSession): Unit = onAccount { restoreNow(saved) }
 
     private fun restoreNow(saved: AccountSession) {
+        val isNew = saved.accessToken != session_?.accessToken
+        if (isNew) sessionSeq += 1
         _session.value = saved.copy(mode = saved.mode ?: SessionMode.DEMO)
         lineage = lineageOf(saved.accessToken)
         shortOnArrival = false
         resetFailures()
         armLifeTimer()
+        if (isNew) releaseLogoutHolds()
     }
 
     /** 回到前台：检查是否要刷新，补发"待退出"。 */
@@ -827,6 +833,16 @@ public class AccountClient(private val o: AccountClientOptions) {
         }
     }
 
+    /** 新会话建立了：进行中的 logout 只关旧会话的事。旧连接已经随"token 换了"断开，它缓存的踢线作废，新会话的踢线不再等它。 */
+    private fun releaseLogoutHolds() {
+        holdDepth -= logoutHolds.size
+        logoutHolds.clear()
+        if (holdDepth > 0) return
+        val held = heldKicks
+        heldKicks = ArrayList()
+        for ((_, d) in held) d.complete(KickDecision.IGNORE)
+    }
+
     // ---- 串行队列（RS4-03） ----
 
     /** 排进串行队列。hold：进行中缓存踢线。 */
@@ -869,6 +885,19 @@ public class AccountClient(private val o: AccountClientOptions) {
         if (refreshQueued) {
             refreshQueued = false
             if (retryTimer == null) triggerNow(RefreshSource.TIMER) // 正在等重试时不提前，到点的定时器会发
+        }
+    }
+
+    /** 登录、注册、找回：建立新会话。logout 进行中也可以用，它结束时不碰这个新会话（问题 A1）。 */
+    private suspend fun enqueueNewSession(path: String, body: JsonObject, hold: Boolean = false): AuthResult = onAccount {
+        val logouts = logoutSeq
+        enqueue(hold) {
+            val resp = parseAuthResponse(send("POST", path, body))
+            if (logouts != logoutSeq) throw SessionEndedError() // 先发的登录，之后点了退出：退出优先
+            sessionSeq += 1 // 在写存储之前：logout 的清除排在后面的话，这样它就不清了
+            val result = applyAuth(resp)
+            releaseLogoutHolds()
+            result
         }
     }
 
@@ -915,7 +944,7 @@ public class AccountClient(private val o: AccountClientOptions) {
     /** GET /v1/config。失败时不猜测模式，由调用方处理（F-ACC-07 规则 4）。 */
     public suspend fun getConfig(): AccountConfig = onAccount { decode(AccountConfig.serializer(), send("GET", "/v1/config")) }
 
-    public suspend fun register(username: String, password: String, nickname: String? = null, inviteCode: String? = null): AuthResult = enqueue {
+    public suspend fun register(username: String, password: String, nickname: String? = null, inviteCode: String? = null): AuthResult {
         val body = buildJsonObject {
             put("username", username)
             put("password", password)
@@ -923,27 +952,27 @@ public class AccountClient(private val o: AccountClientOptions) {
             inviteCode?.let { put("inviteCode", it) }
             deviceFields()
         }
-        applyAuth(parseAuthResponse(send("POST", "/v1/account/register", body)))
+        return enqueueNewSession("/v1/account/register", body)
     }
 
-    public suspend fun login(username: String, password: String): AuthResult = enqueue {
+    public suspend fun login(username: String, password: String): AuthResult {
         val body = buildJsonObject {
             put("username", username)
             put("password", password)
             deviceFields()
         }
-        applyAuth(parseAuthResponse(send("POST", "/v1/account/login", body)))
+        return enqueueNewSession("/v1/account/login", body)
     }
 
     /** 找回（F-ACC-05）。成功后换 sid，响应带新恢复码。 */
-    public suspend fun recover(username: String, recoveryCode: String, newPassword: String): AuthResult = enqueue(hold = true) {
+    public suspend fun recover(username: String, recoveryCode: String, newPassword: String): AuthResult {
         val body = buildJsonObject {
             put("username", username)
             put("recoveryCode", recoveryCode)
             put("newPassword", newPassword)
             deviceFields()
         }
-        applyAuth(parseAuthResponse(send("POST", "/v1/account/recover", body)))
+        return enqueueNewSession("/v1/account/recover", body, hold = true)
     }
 
     /** 主动刷新一次（和其他入口合并）。token 换了才返回；30 秒内没换上时抛错，后台还会按规则继续重试。 */
@@ -974,10 +1003,13 @@ public class AccountClient(private val o: AccountClientOptions) {
     /**
      * 退出（F-ACC-04 规则 1）：先通知服务端，再清本地；连不上也本地退出，sid 和 refresh 存为"待退出"，联网后补发。返回值表示服务端确认了。
      * 进行中的刷新作废，排队的操作失败。断网时最长等 30 秒：界面不要等它，先回登录页。
+     * 只收尾开始时的那个会话：等响应期间登录成功的新会话不受影响，也没有 Ended；旧 sid 的待退出照常（问题 A1）。
      */
     public suspend fun logout(): Boolean = onAccount {
         val s = session_ ?: return@onAccount true
         epoch += 1 // 下面写存储可能挂起：这期间回来的响应不能再采用
+        logoutSeq += 1
+        val seq = sessionSeq
         abandonRefresh()
         if (s.mode != SessionMode.ACCOUNT) {
             endSession(SessionEnd(SessionEndAction.LOGOUT))
@@ -986,12 +1018,14 @@ public class AccountClient(private val o: AccountClientOptions) {
         val refresh = s.refreshToken
         val pending = refresh?.let { PendingLogout(lineage.sid, it) }
         val unacked = memoryOnly
+        val hold = Any()
+        logoutHolds.add(hold)
+        holdDepth += 1
         // 先记下来再清登录态：请求还没回来就被杀，重启后也不会回到登录状态，还能补发。恢复码没确认时 token 只放内存，断网才写。
         if (pending != null && !unacked) addPending(pending)
-        clearStore()
+        clearStore { seq == sessionSeq } // 写待退出时可能已经登录成功，存储里的就是新会话
         var confirmed = false
         var keep = false
-        holdDepth += 1
         try {
             send("POST", PATH_LOGOUT, buildJsonObject { refresh?.let { put("refreshToken", it) } }, bearer = s.accessToken)
             confirmed = true
@@ -1001,16 +1035,17 @@ public class AccountClient(private val o: AccountClientOptions) {
             log.warn("account: logout not confirmed: ${safeDescribe(e)}")
             keep = shouldRetryLogout(e)
         }
-        holdDepth -= 1
+        if (logoutHolds.remove(hold)) holdDepth -= 1
         if (pending != null) {
             if (keep) {
                 if (unacked) addPending(pending)
-                revokeSystemToken()
+                // 有新会话时系统令牌是它在用，不撤销；旧 sid 靠补发解绑，所以马上开始补发。
+                if (seq == sessionSeq) revokeSystemToken() else wakePendingLogouts()
             } else {
                 removePending(pending)
             }
         }
-        endSession(SessionEnd(SessionEndAction.LOGOUT))
+        if (seq == sessionSeq) endSession(SessionEnd(SessionEndAction.LOGOUT))
         confirmed
     }
 
@@ -1339,9 +1374,9 @@ public class AccountClient(private val o: AccountClientOptions) {
         emit(AccountEvent.Ended(e))
     }
 
-    private suspend fun clearStore() {
+    private suspend fun clearStore(stillValid: () -> Boolean = { true }) {
         try {
-            storeLock.withLock { store?.clear() }
+            storeLock.withLock { if (stillValid()) store?.clear() }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {

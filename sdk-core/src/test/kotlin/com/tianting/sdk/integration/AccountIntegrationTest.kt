@@ -239,7 +239,8 @@ class AccountIntegrationTest {
         val (username) = newUser(d1)
         d1.connect()
         val started = System.currentTimeMillis()
-        Device(Platform.IOS).account.login(username, PASSWORD)
+        val d2 = Device(Platform.IOS)
+        d2.account.login(username, PASSWORD)
         until("securityNotice", 2_500) { d1.events.any { it is IMEvent.SecurityNotice } }
         assertTrue(System.currentTimeMillis() - started < 2_500)
         val n = d1.events.filterIsInstance<IMEvent.SecurityNotice>().first()
@@ -247,6 +248,11 @@ class AccountIntegrationTest {
         val events = d1.account.listEvents()
         assertTrue(events.otherSessions.count >= 1)
         assertTrue(events.events.isNotEmpty())
+        // 其他 kind 也要到达 SDK（F-ACC-05 规则 5）。
+        d2.account.regenerateRecoveryCode(PASSWORD)
+        until("recoveryCodeRegenerated", 2_500) { d1.events.any { it is IMEvent.SecurityNotice && it.kind == "recoveryCodeRegenerated" } }
+        val regen = d1.events.filterIsInstance<IMEvent.SecurityNotice>().first { it.kind == "recoveryCodeRegenerated" }
+        assertEquals("ios", regen.platform)
     }
 
     // ---- 刷新 ----

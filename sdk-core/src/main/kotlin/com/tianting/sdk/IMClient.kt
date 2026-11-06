@@ -121,7 +121,8 @@ private const val SOCIAL_RETRY_MS = 6_000L // socialFull 限流每 6 秒恢复�
 private const val SOCIAL_PAGE = 500
 private const val USERS_BATCH = 100
 private const val USERS_MERGE_MS = 16L
-private val SECURITY_NOTICE_KINDS = setOf("newDeviceLogin") // 这一批认识的 securityNotice（server/internal/protocol/frames.go）
+// 这一批认识的 securityNotice：服务端实际发的全部（server/internal/account 的 notify 调用）。
+private val SECURITY_NOTICE_KINDS = setOf("newDeviceLogin", "recoveryCodeRegenerated", "refreshReplay", "refreshRateLimited")
 private const val MAX_SAFE_INTEGER = 9007199254740991L // 打开未知会话时的 beforeSeq，与 sdk-ts 相同
 
 /**

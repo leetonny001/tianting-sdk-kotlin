@@ -549,4 +549,210 @@ class AccountUnifiedTest : AccountTest() {
         assertTrue(a.fatals().isNotEmpty())
         assertFalse(a.account.refreshInflight)
     }
+
+    // ---- A1：logout 进行中登录（frontend-chat 问题表 A1、I6），只收尾开始时的那个会话 ----
+
+    private val loginPath = "/v1/account/login"
+    private fun AccountHarness.loggingOut(): Pair<FakeConnection, kotlinx.coroutines.Deferred<Boolean>> {
+        session(1, DAY, "old")
+        val c = online()
+        return c to start { logout() }
+    }
+
+    private fun AccountHarness.loginAgain(sid: String = "new", code: String? = null) {
+        val p = start { login(USER, "Password-1") }
+        http.last(loginPath).respond(200, authBody(1, clock.now() + DAY, sid, recoveryCode = code, recoveryCodeGen = 3))
+        await(p)
+    }
+
+    @Test
+    fun `A1 旧 logout 的响应晚到：新会话和存储都还在，没有 ended，新 token 连接`() {
+        val a = setupAccount()
+        val (_, out) = a.loggingOut()
+        val call = a.http.last(LOGOUT)
+        a.loginAgain()
+        assertEquals(jwt("new", 1), a.current?.accessToken)
+        assertEquals(jwt("new", 1), a.store.saved?.accessToken)
+        call.respond(200)
+        assertTrue(a.await(out))
+        assertEquals(jwt("new", 1), a.current?.accessToken)
+        assertEquals(jwt("new", 1), a.store.saved?.accessToken)
+        assertEquals(emptyList(), a.ended)
+        assertEquals(emptyList(), a.fatals())
+        assertEquals(jwt("new", 1), authToken(a.authNew()))
+        assertEquals(emptyList(), a.pendingStore.items, "旧 logout 确认了，待退出清掉")
+    }
+
+    @Test
+    fun `A1 旧 logout 失败：不碰新会话，待退出还是旧 sid，补发不带新 token`() {
+        val a = setupAccount()
+        val (_, out) = a.loggingOut()
+        val call = a.http.last(LOGOUT)
+        a.loginAgain()
+        call.fail()
+        assertFalse(a.await(out))
+        assertEquals(jwt("new", 1), a.current?.accessToken)
+        assertEquals(jwt("new", 1), a.store.saved?.accessToken)
+        assertEquals(emptyList(), a.ended)
+        assertEquals(listOf(PendingLogout("old", refreshToken("old", 1))), a.pendingStore.items)
+        assertEquals(emptyList(), a.revokes, "系统令牌这时已经是新会话在用")
+        val retry = a.http.last(LOGOUT)
+        assertFalse(retry === call, "有新会话时立刻补发旧 sid：系统令牌没撤销，要尽快解绑")
+        assertNull(retry.bearer)
+        assertEquals(refreshToken("old", 1), retry.refreshField)
+        retry.respond(200)
+        a.h.flush()
+        assertEquals(emptyList(), a.pendingStore.items)
+        assertEquals(jwt("new", 1), a.current?.accessToken)
+    }
+
+    @Test
+    fun `A1 服务端拒绝旧 logout：记录删除，新会话不动`() {
+        val a = setupAccount()
+        val (_, out) = a.loggingOut()
+        val call = a.http.last(LOGOUT)
+        a.loginAgain()
+        call.respondError(401, 4019)
+        assertFalse(a.await(out))
+        assertEquals(emptyList(), a.pendingStore.items)
+        assertEquals(jwt("new", 1), a.current?.accessToken)
+    }
+
+    @Test
+    fun `A1 待退出还在写时登录成功：logout 接下来不清新 token`() {
+        val a = setupAccount()
+        a.session(1, DAY, "old")
+        a.online()
+        val gate = CompletableDeferred<Unit>()
+        a.pendingStore.pauseSave = gate
+        val out = a.start { logout() }
+        assertEquals(0, a.http.to(LOGOUT).size, "待退出写完才发请求")
+        a.pendingStore.pauseSave = null
+        val login = a.start { login(USER, "Password-1") }
+        a.http.last(loginPath).respond(200, authBody(1, a.clock.now() + DAY, "new")) // 登录的保存排在存储锁上，在 logout 的清除前面
+        val clears = a.store.clears
+        gate.complete(Unit)
+        a.await(login)
+        assertEquals(clears, a.store.clears, "logout 不再清存储")
+        assertEquals(jwt("new", 1), a.store.saved?.accessToken)
+        a.http.last(LOGOUT).respond(200)
+        a.await(out)
+        assertEquals(jwt("new", 1), a.current?.accessToken)
+        assertEquals(jwt("new", 1), a.store.saved?.accessToken)
+        assertEquals(emptyList(), a.ended)
+    }
+
+    @Test
+    fun `A1 新会话只放内存：旧 logout 不写盘，确认才落盘；恢复码没确认的旧 token 失败时才进待退出`() {
+        val a = setupAccount()
+        val (_, out) = a.loggingOut()
+        val call = a.http.last(LOGOUT)
+        a.loginAgain(code = "RC")
+        call.respond(200)
+        a.await(out)
+        assertEquals(jwt("new", 1), a.current?.accessToken)
+        assertNull(a.store.saved)
+        val ack = a.start { ackRecoveryCode(3) }
+        a.http.last(ACK).respond(200)
+        a.await(ack)
+        assertEquals(jwt("new", 1), a.store.saved?.accessToken)
+    }
+
+    @Test
+    fun `A1 logout 进行中登录失败：旧会话照常结束`() {
+        val a = setupAccount()
+        val (_, out) = a.loggingOut()
+        val p = a.start { login(USER, "wrong-password") }
+        a.http.last(loginPath).respondError(401, 4018)
+        assertEquals(4018, a.failure<AccountError>(p).code)
+        a.http.last(LOGOUT).respond(200)
+        a.await(out)
+        assertNull(a.current)
+        assertNull(a.store.saved)
+        assertEquals(listOf(SessionEnd(SessionEndAction.LOGOUT)), a.ended)
+    }
+
+    @Test
+    fun `A1 登录先发、logout 后发：响应不采用，退出优先`() {
+        val a = setupAccount()
+        a.session(1, DAY, "old")
+        a.online()
+        val p = a.start { login(USER, "Password-1") }
+        val out = a.start { logout() }
+        a.http.last(loginPath).respond(200, authBody(1, a.clock.now() + DAY, "new"))
+        a.failure<SessionEndedError>(p)
+        a.http.last(LOGOUT).respond(200)
+        a.await(out)
+        assertNull(a.current)
+        assertNull(a.store.saved)
+        assertEquals(listOf(SessionEnd(SessionEndAction.LOGOUT)), a.ended)
+    }
+
+    @Test
+    fun `A1 两次 logout 各管各的：新会话的 logout 结束新会话，旧的晚到不再有 ended`() {
+        val a = setupAccount()
+        val (_, out1) = a.loggingOut()
+        val first = a.http.last(LOGOUT)
+        a.loginAgain()
+        val out2 = a.start { logout() }
+        val second = a.http.last(LOGOUT)
+        assertFalse(second === first)
+        assertEquals(refreshToken("new", 1), second.refreshField)
+        second.respond(200)
+        a.await(out2)
+        assertNull(a.current)
+        assertEquals(listOf(SessionEnd(SessionEndAction.LOGOUT)), a.ended)
+        first.respond(200)
+        a.await(out1)
+        assertEquals(listOf(SessionEnd(SessionEndAction.LOGOUT)), a.ended)
+        assertEquals(emptyList(), a.pendingStore.items)
+    }
+
+    @Test
+    fun `A1 两个 logout 都没回时第三次登录：第三个会话不受影响`() {
+        val a = setupAccount()
+        val (_, out1) = a.loggingOut()
+        val first = a.http.last(LOGOUT)
+        a.loginAgain()
+        val out2 = a.start { logout() }
+        val second = a.http.last(LOGOUT)
+        a.loginAgain("third")
+        first.respond(200)
+        second.respond(200)
+        a.await(out1)
+        a.await(out2)
+        assertEquals(jwt("third", 1), a.current?.accessToken)
+        assertEquals(jwt("third", 1), a.store.saved?.accessToken)
+        assertEquals(emptyList(), a.ended)
+    }
+
+    @Test
+    fun `A1 旧连接的踢线在等 logout 时缓存，新会话建立后作废；新会话自己的踢线立即生效`() {
+        val a = setupAccount()
+        val (c, out) = a.loggingOut()
+        val call = a.http.last(LOGOUT)
+        a.kicked(c, "sessionRevoked")
+        a.loginAgain()
+        assertEquals(jwt("new", 1), a.current?.accessToken)
+        assertEquals(emptyList(), a.fatals())
+        val c2 = a.authNew()
+        a.kicked(c2, "passwordChanged")
+        assertNull(a.current)
+        assertEquals(listOf("passwordChanged"), a.ended.map { it.reason })
+        call.respond(200)
+        a.await(out)
+        assertEquals(1, a.ended.size)
+    }
+
+    @Test
+    fun `A1 演示会话 restore 也算新会话：旧 logout 不结束它`() {
+        val a = setupAccount()
+        val (_, out) = a.loggingOut()
+        val call = a.http.last(LOGOUT)
+        a.call { restore(AccountSession(mode = SessionMode.DEMO, userId = USER, accessToken = "demo-token")) }
+        call.respond(200)
+        a.await(out)
+        assertEquals("demo-token", a.current?.accessToken)
+        assertEquals(emptyList(), a.ended)
+    }
 }

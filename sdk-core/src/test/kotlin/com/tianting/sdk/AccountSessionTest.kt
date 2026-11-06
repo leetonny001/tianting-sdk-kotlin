@@ -1482,6 +1482,16 @@ class AccountSessionTest : AccountTest() {
         assertEquals(listOf(IMEvent.SecurityNotice("newDeviceLogin", 123, "ios")), a.h.events.filterIsInstance<IMEvent.SecurityNotice>())
     }
 
+    @Test
+    fun `TC-ACC-02-13 服务端发的四种 kind 都放行（AC-ACC-03-25、AC-ACC-03-45，F-ACC-05 规则 5）`() {
+        val a = setupAccount()
+        a.session(1, DAY)
+        val c = a.online()
+        val kinds = listOf("newDeviceLogin", "recoveryCodeRegenerated", "refreshReplay", "refreshRateLimited")
+        for (k in kinds + listOf("newIpPrefix", "")) c.receive(event("securityNotice", "kind" to k, "at" to 1, "platform" to "ios"))
+        assertEquals(kinds, a.h.events.filterIsInstance<IMEvent.SecurityNotice>().map { it.kind })
+    }
+
     // ---- TC-ACC-09-01 ----
 
     @Test

@@ -120,9 +120,13 @@ class MemoryStore : SessionStore {
 class MemoryPendingStore : PendingLogoutStore {
     var items: List<PendingLogout> = emptyList()
     var failSave = false
+
+    /** 设置后，save 写之前停在这里（慢存储）。 */
+    var pauseSave: CompletableDeferred<Unit>? = null
     override suspend fun load(): List<PendingLogout> = items
     override suspend fun save(items: List<PendingLogout>) {
         if (failSave) throw java.io.IOException("disk full")
+        pauseSave?.await()
         this.items = items
     }
 }
