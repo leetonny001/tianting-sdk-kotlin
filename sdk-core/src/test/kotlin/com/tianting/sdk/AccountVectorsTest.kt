@@ -170,7 +170,7 @@ class AccountVectorsTest : AccountTest() {
             srv.now = a.clock.now()
             val (result, gen) = srv.refresh(call.refreshField.split('.')[2].toLong())
             assertTrue(result.startsWith("issued"), result)
-            call.respond(200, authBody(gen!!, a.clock.now() + 5 * HOUR))
+            call.respond(200, authBody(gen!!, a.clock.now() + DAY))
         }
         fun authed() {
             val conn = a.transport.current
@@ -183,7 +183,7 @@ class AccountVectorsTest : AccountTest() {
         a.h.flush()
         authed() // 不足 6 小时：拨号时就开始刷新，换上之后 1000 重连
         repeat(3) {
-            a.clock.advance(60_000)
+            a.clock.advance(18 * HOUR + 60_000) // 不足 6 小时才刷新；刷新回来就不足的不再主动刷新（问题 S1）
             a.foreground()
             authed()
         }

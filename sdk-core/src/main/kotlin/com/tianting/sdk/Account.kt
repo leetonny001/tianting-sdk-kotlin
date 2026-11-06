@@ -54,8 +54,8 @@ public open class AccountNetworkError(message: String = "network error") : Excep
 /** 等了 30 秒没有响应。迟到的响应会被丢弃。 */
 public class AccountTimeoutError : AccountNetworkError("request timed out")
 
-/** 没有可用的账号会话：没登录，或者已经结束（Ended 事件）。 */
-public class SessionEndedError : Exception("account session ended")
+/** 没有可用的账号会话：没登录，或者已经结束（Ended 事件）。end：accessToken() 抛出时带上最近一次结束的原因，没有就是没登录过。 */
+public class SessionEndedError(public val end: SessionEnd? = null) : Exception("account session ended")
 
 public enum class SessionMode(public val wire: String) { ACCOUNT("account"), DEMO("demo") }
 
@@ -311,6 +311,12 @@ public class AccountClient(private val o: AccountClientOptions) {
     private var backoffN = 0
     private var mustRefresh = false // 不看剩余时间也要刷新：token 被拒绝过，或者已经过期
     private var retryTimer: Timer? = null
+
+    /**
+     * 刷新刚返回的 token 按本地时钟已经不足 6 小时（时钟偏快，或者 TTL 配得短，问题 S1）。再刷新也是同样的答案，又要重连，
+     * 会一直循环到服务端限流。所以这个 token 不再主动刷新，也不按本地时间当成过期，等服务端的 4011（规则 7）。
+     */
+    private var shortOnArrival = false
     private var rereadStore = false // superseded 之后重读本地最新 token（规则 6）
     private var lastFailure: Exception? = null
 
@@ -419,6 +425,7 @@ public class AccountClient(private val o: AccountClientOptions) {
     private fun restoreNow(saved: AccountSession) {
         _session.value = saved.copy(mode = saved.mode ?: SessionMode.DEMO)
         lineage = lineageOf(saved.accessToken)
+        shortOnArrival = false
         resetFailures()
         armLifeTimer()
     }
@@ -478,7 +485,7 @@ public class AccountClient(private val o: AccountClientOptions) {
                 endSession(SessionEnd(SessionEndAction.LOGIN, SessionDialog.SESSION_EXPIRED, reason = "expired"))
                 return SessionOutcome.Login(SessionDialog.SESSION_EXPIRED)
             }
-            if (!shouldRefresh(s.accessExpiresAt, s.absoluteExpiresAt, now)) return SessionOutcome.None
+            if (shortOnArrival || !shouldRefresh(s.accessExpiresAt, s.absoluteExpiresAt, now)) return SessionOutcome.None
         }
         if (slotBusy) {
             refreshQueued = true
@@ -545,7 +552,7 @@ public class AccountClient(private val o: AccountClientOptions) {
         backoffN = 0
         lastFailure = null
         settleRefresh(a, RefreshResult.OK)
-        adopt(next, resp)
+        adopt(next, resp, fromRefresh = true)
         record(SessionOutcome.KeepToken)
     }
 
@@ -611,6 +618,7 @@ public class AccountClient(private val o: AccountClientOptions) {
             if (isLocalNewer(l, lineage.asRejected())) {
                 _session.value = latest.copy(mode = SessionMode.ACCOUNT)
                 lineage = l
+                shortOnArrival = false
             }
         } catch (e: CancellationException) {
             throw e
@@ -659,10 +667,11 @@ public class AccountClient(private val o: AccountClientOptions) {
         absoluteExpiresAt = r.absoluteExpiresAt,
     )
 
-    private fun adopt(next: AccountSession, resp: AuthResponse) {
+    private fun adopt(next: AccountSession, resp: AuthResponse, fromRefresh: Boolean = false) {
         _session.value = next
         _ended.value = null
         lineage = lineageOf(next.accessToken)
+        shortOnArrival = fromRefresh && shouldRefresh(next.accessExpiresAt, next.absoluteExpiresAt, clock.now())
         mustRefresh = false
         clearRetryTimer()
         armLifeTimer()
@@ -701,7 +710,7 @@ public class AccountClient(private val o: AccountClientOptions) {
         lifeTimer?.cancel()
         lifeTimer = null
         val s = session_
-        if (s == null || s.mode != SessionMode.ACCOUNT || !connected) return
+        if (s == null || s.mode != SessionMode.ACCOUNT || !connected || shortOnArrival) return
         val final = s.accessExpiresAt == s.absoluteExpiresAt
         // 剩余恰好 6 小时不刷新，所以要过这个点 1 毫秒。
         val at = if (final) s.accessExpiresAt else s.accessExpiresAt - REFRESH_BELOW_MS + 1
@@ -719,8 +728,8 @@ public class AccountClient(private val o: AccountClientOptions) {
     // ---- token 来源（HTTP 和 WS 共用，RS5-10） ----
 
     private suspend fun accessTokenNow(): String {
-        val s = session_ ?: throw SessionEndedError()
-        if (s.mode == SessionMode.ACCOUNT && clock.now() >= s.accessExpiresAt) {
+        val s = session_ ?: throw SessionEndedError(_ended.value)
+        if (s.mode == SessionMode.ACCOUNT && !shortOnArrival && clock.now() >= s.accessExpiresAt) {
             if (s.accessExpiresAt == s.absoluteExpiresAt) {
                 endSession(SessionEnd(SessionEndAction.LOGIN, SessionDialog.SESSION_EXPIRED, reason = "expired"))
                 throw SessionEndedError()
@@ -874,7 +883,7 @@ public class AccountClient(private val o: AccountClientOptions) {
         var i = 0
         while (true) {
             val s = session_ ?: throw SessionEndedError()
-            if (clock.now() >= s.accessExpiresAt) refreshInSlot()
+            if (!shortOnArrival && clock.now() >= s.accessExpiresAt) refreshInSlot()
             val token = session_?.accessToken ?: throw SessionEndedError()
             try {
                 return sendAuthed(method, path, body, token)
@@ -1025,10 +1034,16 @@ public class AccountClient(private val o: AccountClientOptions) {
             }
             throw e
         }
-        val s = session_
-        if (memoryOnly && s != null) {
-            memoryOnly = false
+        if (!memoryOnly) return@onAccount
+        // 写到"存的就是在用的"才清标记：写的时候刷新还是只放内存，写失败抛给调用方，再调一次能重写（问题 S3）。
+        // 写的时候会话结束：存储有锁，结束时的清除排在这次写入后面，所以不用再清。
+        while (true) {
+            val s = session_ ?: break
             storeLock.withLock { store?.save(s) }
+            if (session_ === s) {
+                memoryOnly = false
+                break
+            }
         }
     }
 
@@ -1296,6 +1311,7 @@ public class AccountClient(private val o: AccountClientOptions) {
         epoch += 1
         _session.value = null
         memoryOnly = false
+        shortOnArrival = false
         abandonRefresh()
         resetFailures()
         refreshQueued = false

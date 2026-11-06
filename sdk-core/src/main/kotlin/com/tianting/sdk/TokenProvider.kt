@@ -30,7 +30,7 @@ public data class SessionEnd(
  * 回调可能在别的线程，IMClient 自己切回 SDK 线程。
  */
 public interface TokenProvider {
-    /** 拨号前调用。已过期时先刷新再返回；会话结束时抛 SessionEndedError。 */
+    /** 拨号前调用。已过期时先刷新再返回；会话结束时抛 SessionEndedError，连接发 Session 类 Fatal（问题 K7）。 */
     public suspend fun accessToken(): String
 
     /** 连接收到 kicked/tokenExpired 或关闭码 4011（规则 7）。返回后再 accessToken() 就是可用的；会话结束时抛 SessionEndedError。 */

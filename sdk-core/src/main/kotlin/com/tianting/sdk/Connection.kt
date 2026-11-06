@@ -34,7 +34,7 @@ public sealed interface FatalReason {
         override fun toString(): String = "Closed(code=$code, reason=$reason)"
     }
 
-    /** 账号会话结束（connect(tokenProvider)）：刷新得到 4019，或者 access 到达绝对上限。要显示的文字用 sessionDialogText(end.dialog, end.recoverBefore)。 */
+    /** 账号会话结束（connect(tokenProvider)）：刷新得到 4019，access 到达绝对上限，或者连接时会话已经结束（问题 K7）。要显示的文字用 sessionDialogText(end.dialog, end.recoverBefore)。 */
     public data class Session(val end: SessionEnd) : Closed(end.code ?: 0, end.reason ?: "")
 }
 
@@ -215,14 +215,15 @@ internal class Connection(
             openSocket(gen)
             return
         }
-        // 启动已过期时这里会先刷新（规则 5）。会话结束时不用在这里处理：IMClient 从 onEnded 收到。
+        // 启动已过期时这里会先刷新（规则 5）。等的时候会话才结束：IMClient 从 onEnded 收到，已经 stop，这里什么都不做。
         launch {
             val fresh = try {
                 p.accessToken()
             } catch (e: CancellationException) {
                 throw e
-            } catch (_: Exception) {
+            } catch (e: Exception) {
                 log.debug("im: no token, session ended")
+                post { if (gen == connGen && active && provider === p) emitNoSession(e) }
                 null
             }
             // 也经过 post：排在"token 换了"的通知后面，否则那个通知会把刚拨的连接断开重拨。
@@ -235,6 +236,15 @@ internal class Connection(
                 }
             }
         }
+    }
+
+    /** 连接时会话已经结束（问题 K7）：不会有 onEnded 了，不能停在连接中。 */
+    private fun emitNoSession(e: Exception) {
+        val end = (e as? SessionEndedError)?.end?.copy(fromKick = false) ?: SessionEnd(SessionEndAction.LOGIN)
+        active = false
+        token = ""
+        setState(ConnState.DISCONNECTED)
+        listener.onFatal(FatalReason.Session(end))
     }
 
     private fun openSocket(gen: Int) {

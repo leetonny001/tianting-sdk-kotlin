@@ -832,7 +832,8 @@ class AccountSessionTest : AccountTest() {
         a.clock.advance(1_000)
         a.refresh().superseded(1)
         a.clock.advance(1_000)
-        a.refresh().respond(200, authBody(2, a.clock.now() + HOUR))
+        a.refresh().respond(200, authBody(2, a.clock.now() + DAY))
+        a.clock.advance(18 * HOUR + 1) // 刷新回来就不足 6 小时的 token 不再主动刷新（问题 S1）
         a.foreground()
         repeat(2) {
             a.refresh().superseded(1)
