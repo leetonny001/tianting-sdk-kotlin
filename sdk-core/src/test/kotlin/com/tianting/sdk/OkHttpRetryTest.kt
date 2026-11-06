@@ -186,6 +186,20 @@ class OkHttpRetryTest {
     }
 
     @Test
+    fun `第 21 节 16 没有请求体的 GET 也不隐式重发、不跟随重定向（请求体 one-shot 管不到它）`() {
+        val s = staleAfterFirst()
+        val t = OkHttpHttpTransport()
+        assertEquals(200, send(t, "${s.url}/a", "GET", null))
+        assertEquals(null, send(t, "${s.url}/v1/account/events", "GET", null))
+        assertEquals(2, s.requests.size)
+
+        val other = server { _, _ -> JSON_OK }
+        val r = server { _, _ -> "HTTP/1.1 302 Found\r\nLocation: ${other.url}/x\r\nContent-Length: 0\r\n\r\n" }
+        assertEquals(302, send(t, "${r.url}/v1/account/events", "GET", null))
+        assertEquals(0, other.requests.size)
+    }
+
+    @Test
     fun `连不上：只回调一次 onFailure；URL 不合法也不抛异常`() {
         val port = ServerSocket(0).use { it.localPort }
         assertEquals(null, send(OkHttpHttpTransport(), "http://127.0.0.1:$port/x"))

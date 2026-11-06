@@ -61,6 +61,18 @@ class AccountSessionTest : AccountTest() {
     }
 
     @Test
+    fun `TC-ACC-03-10 恰好 6 小时：回前台也不刷新，少 1 毫秒才刷新`() {
+        val a = setupAccount()
+        a.session(1, 6 * HOUR + MIN)
+        a.clock.advance(MIN)
+        a.foreground()
+        assertEquals(0, a.http.to(REFRESH).size)
+        a.clock.advance(1)
+        a.foreground()
+        assertEquals(1, a.http.to(REFRESH).size)
+    }
+
+    @Test
     fun `TC-ACC-03-10 没有连接时不用定时器，回前台才检查；新 token 先落盘再使用（R-CF-09）`() {
         val a = setupAccount()
         a.session(1, HOUR)
@@ -391,6 +403,19 @@ class AccountSessionTest : AccountTest() {
     }
 
     @Test
+    fun `TC-ACC-03-12 200 但 refreshToken 是空串：按网络错误，不换 token`() {
+        val a = setupAccount()
+        a.session(1, HOUR)
+        a.foreground()
+        val body = jsonOf(authBody(2, a.clock.now() + DAY).toString().replace(refreshToken("sid1", 2), ""))
+        a.refresh().respond(200, body)
+        assertEquals(1L, a.account.localGen)
+        assertEquals(refreshToken("sid1", 1), a.current?.refreshToken)
+        a.clock.advance(1_000)
+        assertEquals(2, a.http.to(REFRESH).size)
+    }
+
+    @Test
     fun `TC-ACC-03-12 不认识的错误码回登录页（有 code 按 model go）`() {
         val a = setupAccount()
         a.session(1, HOUR)
@@ -516,6 +541,16 @@ class AccountSessionTest : AccountTest() {
         assertEquals(0, a.http.calls.size)
         a.clock.advance(60_000)
         assertEquals(1, a.transport.connections.size)
+    }
+
+    @Test
+    fun `演示模式：账号会话结束后 connect(token)，不再走 token 来源`() {
+        val a = setupAccount()
+        a.session(1, DAY)
+        a.kicked(a.online(), "tooManyConnections", 4429) // 连接停了，账号会话还在
+        a.im.connect("demo-token")
+        a.h.flush()
+        assertEquals("demo-token", authToken(a.h.login("demo")))
     }
 
     @Test
@@ -1557,6 +1592,18 @@ class AccountSessionTest : AccountTest() {
         a.failure<SessionEndedError>(p)
         assertNull(a.current)
         assertNull(a.store.saved)
+    }
+
+    @Test
+    fun `会话结束时，等 token 的调用方都收到 SessionEndedError，不会一直挂着`() {
+        val a = setupAccount()
+        a.session(1, DAY)
+        val waiting = a.start { refresh() }
+        val events = a.start { listEvents() }
+        a.http.last("/v1/account/events").respondError(401, 4011) // 也在等这次刷新
+        a.refresh().respondError(401, 4019, "revoked")
+        a.failure<SessionEndedError>(waiting)
+        a.failure<SessionEndedError>(events)
     }
 
     @Test
