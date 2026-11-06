@@ -304,6 +304,7 @@ public class AccountClient(private val o: AccountClientOptions) {
     @Volatile
     private var lineage = TokenLineage("", 0)
     private var memoryOnly = false // 恢复码确认之前 token 只放内存（F-ACC-05 规则 1）
+    private var unackedGen: Long? = null // 只放内存时，等确认的是哪一代恢复码：确认别的代不算
 
     private var attempt = 0L
     private var inflight: Inflight? = null
@@ -687,6 +688,7 @@ public class AccountClient(private val o: AccountClientOptions) {
         val startEpoch = epoch
         val next = sessionFrom(resp)
         memoryOnly = resp.recoveryCode != null || (keepMemoryOnly && memoryOnly)
+        if (resp.recoveryCode != null) unackedGen = resp.recoveryCodeGen else if (!memoryOnly) unackedGen = null
         try {
             storeLock.withLock { if (memoryOnly) store?.clear() else store?.save(next) }
         } catch (e: CancellationException) {
@@ -1018,6 +1020,8 @@ public class AccountClient(private val o: AccountClientOptions) {
         val code = r?.str("recoveryCode")?.takeIf { it.isNotEmpty() }
         val gen = r?.long("recoveryCodeGen")
         if (code == null || gen == null) throw AccountNetworkError("invalid response")
+        // 还只放内存时要确认的就是这一代。响应可能比之后的改密晚到：代号只进不退。
+        if (memoryOnly) unackedGen = maxOf(unackedGen ?: 0, gen)
         RecoveryCode(code, gen)
     }
 
@@ -1034,14 +1038,15 @@ public class AccountClient(private val o: AccountClientOptions) {
             }
             throw e
         }
-        if (!memoryOnly) return@onAccount
+        // 确认的是旧的一代（确认进行中改密、找回或重新生成换了代）：这一代的新 token 还不能落盘（RS5-13）。
         // 写到"存的就是在用的"才清标记：写的时候刷新还是只放内存，写失败抛给调用方，再调一次能重写（问题 S3）。
         // 写的时候会话结束：存储有锁，结束时的清除排在这次写入后面，所以不用再清。
-        while (true) {
+        while (memoryOnly && gen == unackedGen) {
             val s = session_ ?: break
             storeLock.withLock { store?.save(s) }
-            if (session_ === s) {
+            if (session_ === s && gen == unackedGen) {
                 memoryOnly = false
+                unackedGen = null
                 break
             }
         }
@@ -1311,6 +1316,7 @@ public class AccountClient(private val o: AccountClientOptions) {
         epoch += 1
         _session.value = null
         memoryOnly = false
+        unackedGen = null
         shortOnArrival = false
         abandonRefresh()
         resetFailures()

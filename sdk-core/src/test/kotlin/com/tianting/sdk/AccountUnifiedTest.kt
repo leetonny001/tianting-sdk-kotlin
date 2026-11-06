@@ -12,6 +12,8 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 private const val ACK = "/v1/account/recovery-code/ack"
+private const val REGEN = "/v1/account/recovery-code"
+private const val RECOVER = "/v1/account/recover"
 
 /** 超过这么多次就不再应答：修复前循环一直在调度器里跑，这样用例是断言失败，不是卡死。 */
 private const val ANSWER_CAP = 50
@@ -361,6 +363,149 @@ class AccountUnifiedTest : AccountTest() {
         a.await(out)
         assertNull(a.current)
         assertNull(a.store.saved)
+    }
+
+    // ---- 恢复码确认和换代交错：ack 只对当前未确认的那一代生效（F-ACC-05 规则 1，RS5-13） ----
+
+    private fun AccountHarness.withCode(sid: String, code: Long) =
+        authBody(1, clock.now() + DAY, sid = sid, recoveryCode = "CODE-$code", recoveryCodeGen = code)
+
+    /** 改密拿到第 2 代恢复码，没有确认。sid 是 sid2。 */
+    private fun AccountHarness.unackedGen2() {
+        session(1, DAY)
+        val change = start { changePassword("Password-1", "Password-2") }
+        http.last(PASSWORD).respond(200, withCode("sid2", 2))
+        await(change)
+        assertNull(store.saved)
+    }
+
+    /** 还只放内存：刷新不落盘。 */
+    private fun AccountHarness.stillMemoryOnly(sid: String) {
+        val next = account.localGen + 1
+        clock.advance(18 * HOUR + 1)
+        foreground()
+        refresh().respond(200, authBody(next, clock.now() + DAY, sid = sid))
+        assertEquals(jwt(sid, next), current?.accessToken)
+        assertNull(store.saved)
+    }
+
+    private fun AccountHarness.ackNow(gen: Long) {
+        val p = start { ackRecoveryCode(gen) }
+        http.last(ACK).respond(200)
+        await(p)
+    }
+
+    @Test
+    fun `恢复码 ack(2) 进行中改密拿到第 3 代：第 2 代的响应不让新 token 落盘，确认第 3 代才写`() {
+        val a = setupAccount()
+        a.unackedGen2()
+        val stale = a.start { ackRecoveryCode(2) }
+        val staleCall = a.http.last(ACK)
+        val change = a.start { changePassword("Password-2", "Password-3") }
+        a.http.last(PASSWORD).respond(200, a.withCode("sid3", 3))
+        a.await(change)
+        staleCall.respond(200)
+        a.await(stale)
+        assertNull(a.store.saved)
+        a.stillMemoryOnly("sid3")
+        a.ackNow(3)
+        assertEquals(jwt("sid3", 2), a.store.saved?.accessToken)
+    }
+
+    @Test
+    fun `恢复码 ack(2) 进行中重新生成拿到第 3 代：第 2 代的响应不落盘，确认第 3 代才写`() {
+        val a = setupAccount()
+        a.unackedGen2()
+        val stale = a.start { ackRecoveryCode(2) }
+        val staleCall = a.http.last(ACK)
+        val regen = a.start { regenerateRecoveryCode("Password-2") }
+        a.http.last(REGEN).respond(200, jsonOf("""{"recoveryCode":"CODE-3","recoveryCodeGen":3}"""))
+        a.await(regen)
+        staleCall.respond(200)
+        a.await(stale)
+        assertNull(a.store.saved)
+        a.stillMemoryOnly("sid2")
+        a.ackNow(3)
+        assertEquals(jwt("sid2", 2), a.store.saved?.accessToken)
+    }
+
+    @Test
+    fun `恢复码 ack(2) 进行中找回拿到第 3 代：第 2 代的响应不落盘，确认第 3 代才写`() {
+        val a = setupAccount()
+        a.unackedGen2()
+        val stale = a.start { ackRecoveryCode(2) }
+        val staleCall = a.http.last(ACK)
+        val recover = a.start { recover(USER, "CODE-2", "Password-3") }
+        a.http.last(RECOVER).respond(200, a.withCode("sid3", 3))
+        a.await(recover)
+        staleCall.respond(200)
+        a.await(stale)
+        assertNull(a.store.saved)
+        a.stillMemoryOnly("sid3")
+        a.ackNow(3)
+        assertEquals(jwt("sid3", 2), a.store.saved?.accessToken)
+    }
+
+    @Test
+    fun `恢复码 ack(2) 正在写存储时改密拿到第 3 代：写的旧值被清掉，标记保持`() {
+        val a = setupAccount()
+        a.unackedGen2()
+        val gate = CompletableDeferred<Unit>()
+        a.store.pauseBeforeSave = gate
+        val stale = a.start { ackRecoveryCode(2) }
+        a.http.last(ACK).respond(200)
+        val change = a.start { changePassword("Password-2", "Password-3") }
+        a.http.last(PASSWORD).respond(200, a.withCode("sid3", 3))
+        a.store.pauseBeforeSave = null
+        gate.complete(Unit)
+        a.h.flush()
+        a.await(stale)
+        a.await(change)
+        assertEquals(jwt("sid3", 1), a.current?.accessToken)
+        assertNull(a.store.saved)
+        a.stillMemoryOnly("sid3")
+    }
+
+    @Test
+    fun `恢复码 重新生成的响应比改密晚到：代号不倒退，确认最新一代才写`() {
+        val a = setupAccount()
+        a.unackedGen2()
+        val regen = a.start { regenerateRecoveryCode("Password-2") }
+        val regenCall = a.http.last(REGEN)
+        val change = a.start { changePassword("Password-2", "Password-3") }
+        a.http.last(PASSWORD).respond(200, a.withCode("sid3", 4))
+        a.await(change)
+        regenCall.respond(200, jsonOf("""{"recoveryCode":"CODE-3","recoveryCodeGen":3}"""))
+        a.await(regen)
+        a.ackNow(4)
+        assertEquals(jwt("sid3", 1), a.store.saved?.accessToken)
+    }
+
+    @Test
+    fun `恢复码 退出其他设备不换恢复码：代号留着，确认这一代还能写`() {
+        val a = setupAccount()
+        a.unackedGen2()
+        val others = a.start { logoutOthers("Password-2") }
+        a.http.last("/v1/account/logout-others").respond(200, authBody(1, a.clock.now() + DAY, sid = "sid3"))
+        a.await(others)
+        assertNull(a.store.saved)
+        a.ackNow(2)
+        assertEquals(jwt("sid3", 1), a.store.saved?.accessToken)
+    }
+
+    @Test
+    fun `恢复码 确认过之后：刷新正常落盘，重新生成不让 token 回到只放内存`() {
+        val a = setupAccount()
+        a.unackedGen2()
+        a.ackNow(2)
+        val regen = a.start { regenerateRecoveryCode("Password-2") }
+        a.http.last(REGEN).respond(200, jsonOf("""{"recoveryCode":"CODE-3","recoveryCodeGen":3}"""))
+        a.await(regen)
+        a.ackNow(3)
+        a.clock.advance(18 * HOUR + 1)
+        a.foreground()
+        a.refresh().respond(200, authBody(2, a.clock.now() + DAY, sid = "sid2"))
+        assertEquals(jwt("sid2", 2), a.store.saved?.accessToken)
     }
 
     // ---- K5 ----
