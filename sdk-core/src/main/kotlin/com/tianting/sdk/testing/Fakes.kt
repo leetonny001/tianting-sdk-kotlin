@@ -2,6 +2,11 @@
 package com.tianting.sdk.testing
 
 import com.tianting.sdk.Clock
+import com.tianting.sdk.HttpCall
+import com.tianting.sdk.HttpCallback
+import com.tianting.sdk.HttpRequest
+import com.tianting.sdk.HttpResponse
+import com.tianting.sdk.HttpTransport
 import com.tianting.sdk.Timer
 import com.tianting.sdk.Transport
 import com.tianting.sdk.TransportConnection
@@ -13,6 +18,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.put
+import java.net.URI
 
 /** 可控时钟：advance(ms) 时按到期顺序执行定时器，心跳、超时、退避、节流都能确定性地测试。afterEach 在每个定时器之后调用。 */
 public open class FakeClock(start: Long = 1_700_000_000_000) : Clock {
@@ -115,6 +121,93 @@ public class FakeConnection(public val url: String, private val h: TransportHand
             },
         )
     }
+}
+
+/** 一个假 HTTP 请求，由测试代码决定什么时候、怎么回。已经结束或者被放弃的请求再回也不报错：真实网络上迟到的响应就是这样。 */
+public class FakeHttpCall internal constructor(
+    public val req: HttpRequest,
+    private val callback: HttpCallback,
+    private val afterEach: () -> Unit,
+) : HttpCall {
+    public var settled: Boolean = false
+        private set
+
+    /** SDK 放弃了这个请求。不影响 respond：响应还可以迟到，SDK 必须自己丢弃。 */
+    public var cancelled: Boolean = false
+        private set
+
+    public val path: String get() = URI(req.url).path
+    public val query: String? get() = URI(req.url).query
+
+    /** 请求体（已解析）。 */
+    public val json: JsonObject
+        get() = req.body?.let { Json.parseToJsonElement(it) as JsonObject } ?: JsonObject(emptyMap())
+
+    public val bearer: String? get() = req.headers["Authorization"]?.removePrefix("Bearer ")
+
+    override fun cancel() {
+        cancelled = true
+    }
+
+    public fun respond(status: Int, text: String) {
+        settled = true
+        callback.onResponse(HttpResponse(status, text))
+        afterEach()
+    }
+
+    public fun respond(status: Int, body: JsonElement = JsonObject(emptyMap())): Unit = respond(status, body.toString())
+
+    /** 回错误响应，形状同服务端 ErrorResponse。 */
+    public fun respondError(status: Int, code: Int, reason: String? = null, details: JsonObject? = null, msg: String = "error") {
+        respond(
+            status,
+            buildJsonObject {
+                put("code", code)
+                put("msg", msg)
+                reason?.let { put("reason", it) }
+                details?.let { put("details", it) }
+            },
+        )
+    }
+
+    /** 模拟网络错误。 */
+    public fun fail() {
+        settled = true
+        callback.onFailure()
+        afterEach()
+    }
+}
+
+/**
+ * 假 HTTP（PRD-chat 第 4.5 节，FakeTransport 只有 WS）：记录每个请求，默认一直不回应答，由测试代码控制。
+ * 设置 onRequest 可以自动应答，用来搭假服务端。cancel 只做记录，被放弃的请求还能让响应迟到。
+ */
+public class FakeHttp(public var afterEach: () -> Unit = {}) : HttpTransport {
+    public val calls: MutableList<FakeHttpCall> = ArrayList()
+    public var onRequest: ((FakeHttpCall) -> Unit)? = null
+    private var inRequest = 0
+
+    override fun request(req: HttpRequest, callback: HttpCallback): HttpCall {
+        // 自动应答发生在 SDK 线程的任务里，由外层的 flush 接着跑，这里不能再嵌套一次。
+        val call = FakeHttpCall(req, callback) { if (inRequest == 0) afterEach() }
+        calls.add(call)
+        inRequest++
+        try {
+            onRequest?.invoke(call)
+        } finally {
+            inRequest--
+        }
+        return call
+    }
+
+    /** 发到某个路径的全部请求（按发出顺序）。 */
+    public fun to(path: String): List<FakeHttpCall> = calls.filter { it.path == path }
+
+    /** 发到某个路径的最后一个请求。 */
+    public fun last(path: String): FakeHttpCall = to(path).lastOrNull() ?: throw AssertionError("no request to $path")
+
+    /** 还没有回应答的请求。 */
+    public val pending: List<FakeHttpCall> get() = calls.filter { !it.settled }
 }
 
 /** 假传输层：每次 open 产生一条 FakeConnection，测试代码通过 connections 控制它们。 */

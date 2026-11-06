@@ -40,8 +40,10 @@ fun renderErrors(file: File): String {
     fun q(s: String) = "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"").replace("$", "\\$") + "\""
 
     @Suppress("UNCHECKED_CAST")
-    val spec = JsonSlurper().parse(file) as Map<String, List<Map<String, Any?>>>
-    val errors = spec.getValue("errors").filter { e -> (e["scope"] as List<*>).any { it != "console" } }
+    val spec = JsonSlurper().parse(file) as Map<String, Any?>
+
+    fun list(key: String) = spec.getValue(key) as List<Map<String, Any?>>
+    val errors = list("errors").filter { e -> (e["scope"] as List<*>).any { it != "console" } }
     val out = StringBuilder()
     out.appendLine("// 由 ./gradlew :sdk-core:generateErrors 从 protocol/errors.json 生成，不要手改。")
     out.appendLine("package com.tianting.sdk")
@@ -58,19 +60,32 @@ fun renderErrors(file: File): String {
     }
     out.appendLine(")")
     out.appendLine()
+    out.appendLine("/** client scope 的错误码：账号和文件的 HTTP 接口会返回（PRD-chat 第 11.5 节，F-SYS-01）。 */")
+    out.appendLine("public val CLIENT_ERROR_CODES: Set<Int> = setOf(")
+    errors.filter { (it["scope"] as List<*>).contains("client") }.forEach { out.appendLine("    ${it["code"]},") }
+    out.appendLine(")")
+    out.appendLine()
+    out.appendLine("/** 错误码 → 细分的 reason（PRD-chat 第 11.5 节）。收到没有列出的 reason 不能报错。 */")
+    out.appendLine("public val ERROR_REASONS: Map<Int, List<String>> = mapOf(")
+    @Suppress("UNCHECKED_CAST")
+    (spec["reasons"] as Map<String, Any?>? ?: emptyMap()).filterKeys { it != "\$comment" }.forEach { (k, v) ->
+        out.appendLine("    $k to listOf(${(v as List<*>).joinToString(", ") { q(it as String) }}),")
+    }
+    out.appendLine(")")
+    out.appendLine()
     out.appendLine("/** WebSocket 关闭码。 */")
     out.appendLine("public object CloseCode {")
-    spec.getValue("closeCodes").forEach { out.appendLine("    public const val ${it["name"]}: Int = ${it["code"]}") }
+    list("closeCodes").forEach { out.appendLine("    public const val ${it["name"]}: Int = ${it["code"]}") }
     out.appendLine("}")
     out.appendLine()
     out.appendLine("/** 关闭后是否应该自动重连（未列出的关闭码按可以重连处理）。 */")
     out.appendLine("internal val CLOSE_RECONNECT: Map<Int, Boolean> = mapOf(")
-    spec.getValue("closeCodes").forEach { out.appendLine("    ${it["code"]} to ${it["reconnect"]},") }
+    list("closeCodes").forEach { out.appendLine("    ${it["code"]} to ${it["reconnect"]},") }
     out.appendLine(")")
     out.appendLine()
     out.appendLine("/** 被踢原因 → 关闭码（null 表示保留值，一期不出现）。 */")
     out.appendLine("internal val KICK_CLOSE_CODE: Map<String, Int?> = mapOf(")
-    spec.getValue("kickReasons").forEach { out.appendLine("    ${q(it["reason"] as String)} to ${it["closeCode"]},") }
+    list("kickReasons").forEach { out.appendLine("    ${q(it["reason"] as String)} to ${it["closeCode"]},") }
     out.appendLine(")")
     return out.toString()
 }
