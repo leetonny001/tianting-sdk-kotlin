@@ -97,12 +97,33 @@ im.connect(token)
 
 token 不进本地库。数据库文件放在应用私有目录。
 
+## 账号（FE-611）
+
+`AccountClient` 是账号 HTTP 接口和账号会话，独立于 `IMClient`。语义和 sdk-ts 相同，基准是 tianting-server 的 `docs/sdk/README.md` 第 6 节。
+
+```kotlin
+val account = AccountClient(AccountClientOptions(baseUrl = "https://im.example.com", store = sessionStore, pendingLogoutStore = pendingStore))
+account.bindNetwork(context)                 // sdk-android：联网时补发"待退出"，登录页也要有
+account.start()                              // 读存储，已过期的先刷新，补发"待退出"
+val r = account.login(username, password)    // 带 recoveryCode 时进保存页，确认后 ackRecoveryCode(gen)
+im.connect(account.tokenProvider)            // 账号模式；connect(token) 是演示模式，行为不变
+```
+
+| 要点 | 说明 |
+|---|---|
+| 存储 | `SessionStore`、`PendingLogoutStore` 由 App 实现（Keystore 加密文件）。`AccountSession.toJson()` / `fromJson()`：`fromJson` 认识老版本的 `{userId, token}`，`mode` 为 null，`restore` 按演示会话处理（R-CF-11） |
+| 落盘 | 新 token 先落盘再使用，落盘失败按退避重试（R-CF-09）。带恢复码的响应清掉存储里的旧值，确认前只放内存（RS5-13） |
+| 退出 | `logout()` 先写"待退出"再清登录态，再发请求：请求没回来就被杀，重启也不会回到登录状态。断网最长等 30 秒，界面不要等它。`SystemTokenRevoker` 是系统令牌注销的调用点，FCM 随 C3 |
+| 回调 | 会话结束看 `events`（`AccountEvent.Ended`）或 `ended`，连接上的结束看 `IMEvent.Fatal`。`FatalReason.Session` 是 `Closed` 的子类，文字用 `sessionDialogText(end.dialog, end.recoverBefore)` |
+| HTTP | `OkHttpHttpTransport`：`retryOnConnectionFailure`、重定向都关了，请求体 one-shot，同一个 refresh 不会被隐式多发（`OkHttpRetryTest`）。不要给它装 `HttpLoggingInterceptor` |
+| 凭证 | token、refresh、恢复码不进 URL、日志、异常。`AccountSession` 等的 `toString` 不带它们 |
+
 ## 开发
 
 需要 JDK 21。Gradle 用项目内的 Wrapper。
 
 ```bash
-./gradlew :sdk-core:test              # 单元测试（假传输层 + 假时钟 + 真 SQLite 文件）
+./gradlew :sdk-core:test              # 单元测试（假传输层 + 假 HTTP + 假时钟 + 真 SQLite 文件）
 ./gradlew :sdk-core:check             # 上面 + ErrorCodes.gen.kt 与 protocol/errors.json 一致性
 ANDROID_HOME=… ./gradlew :sdk-android:testDebugUnitTest          # Android 适配层（Robolectric 原生 SQLite）
 ANDROID_HOME=… ./gradlew :sdk-android:connectedDebugAndroidTest  # 连着设备 / 模拟器：系统 SQLite、android.icu
@@ -116,7 +137,7 @@ ANDROID_HOME=… ./gradlew :sdk-android:connectedDebugAndroidTest  # 连着设�
 scripts/sync-protocol.sh       # 默认从同级目录 ../tianting-server（或 ../im-mvp）同步，并重新生成 ErrorCodes.gen.kt
 ```
 
-错误码由 `./gradlew :sdk-core:generateErrors` 生成，`check` 任务和 `VectorsTest` 都会校验一致。SDK 发出的每一帧在单元测试里都会用 `frame.schema.json` 校验。
+错误码由 `./gradlew :sdk-core:generateErrors` 生成，`check` 任务和 `VectorsTest` 都会校验一致。SDK 发出的每一帧在单元测试里都会用 `frame.schema.json` 校验，账号接口的请求体用 `http-client.schema.json` 校验。假 HTTP 是 `com.tianting.sdk.testing.FakeHttp`。
 
 ## 集成测试
 

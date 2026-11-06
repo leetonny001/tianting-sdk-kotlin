@@ -187,7 +187,8 @@ abstract class SdkTest {
         random: () -> Double = { 0.5 }, // 抖动为 0，退避间隔精确
         pushCursorStore: PushCursorStore? = null,
         pushLimits: PushLimits = PushLimits(),
-    ): Harness = Harness(platform, database, clock, random, pushCursorStore, pushLimits).also { harnesses.add(it) }
+        timings: IMClientTimings = IMClientTimings(),
+    ): Harness = Harness(platform, database, clock, random, pushCursorStore, pushLimits, timings).also { harnesses.add(it) }
 
     @AfterEach
     fun framesMatchSchema() {
@@ -203,10 +204,11 @@ class Harness(
     random: () -> Double,
     pushCursorStore: PushCursorStore? = null,
     pushLimits: PushLimits = PushLimits(),
+    timings: IMClientTimings = IMClientTimings(),
 ) {
     val scheduler = TestCoroutineScheduler()
-    private val dispatcher = StandardTestDispatcher(scheduler)
-    private val callScope = CoroutineScope(dispatcher + SupervisorJob())
+    val dispatcher = StandardTestDispatcher(scheduler)
+    val callScope = CoroutineScope(dispatcher + SupervisorJob())
     val transport = FakeTransport { flush() }
     val logs = ArrayList<String>()
     var visible = true
@@ -232,6 +234,7 @@ class Harness(
             dispatcher = dispatcher,
             pushCursorStore = pushCursorStore,
             pushLimits = pushLimits,
+            timings = timings,
         ),
     )
 

@@ -58,6 +58,15 @@ class TestServer private constructor(private val proc: Process, private val admi
         return if (res.body().isEmpty()) JsonObject(emptyMap()) else Json.parseToJsonElement(res.body()).jsonObject
     }
 
+    /** 邀请码（F-ACC-09）。调用方要有 account.invite。 */
+    fun signedInvite(maxUses: Int): JsonObject = signed(
+        "POST",
+        "/admin/invites",
+        com.tianting.sdk.obj("count" to 1, "maxUses" to maxUses, "expiresAt" to System.currentTimeMillis() + 86_400_000),
+    )
+
+    fun signedListInvites(): JsonObject = signed("GET", "/admin/invites")
+
     fun token(userId: String): String =
         admin("POST", "/admin/users/token", com.tianting.sdk.obj("userId" to userId))["token"]!!.jsonPrimitive.content
 
@@ -76,7 +85,7 @@ class TestServer private constructor(private val proc: Process, private val admi
 
     companion object {
         private val bin: File by lazy {
-            val dir = Files.createTempDirectory("im-sdk-it-").toFile()
+            val dir = (System.getenv("TIANTING_BIN_DIR")?.let { File(it).apply { mkdirs() } } ?: Files.createTempDirectory("im-sdk-it-").toFile())
             val out = File(dir, "im-server")
             val p = ProcessBuilder("go", "build", "-o", out.absolutePath, "./cmd/im-server")
                 .directory(serverDir()).inheritIO().start()
@@ -101,7 +110,7 @@ class TestServer private constructor(private val proc: Process, private val admi
             val dir = Files.createTempDirectory("im-sdk-db-").toFile()
             val callers = File(dir, "callers.json")
             val secret = Base64.getEncoder().encodeToString(CALLER_SECRET.toByteArray())
-            callers.writeText("""[{"id":"$CALLER_ID","alg":"hmac-sha256","secret":"$secret","scopes":["user.ban","msg.delete","mute.write","group.write","social.settings","social.friends","push.user","push.all"],"pushTypes":["notice","promo"]}]""")
+            callers.writeText("""[{"id":"$CALLER_ID","alg":"hmac-sha256","secret":"$secret","scopes":["user.ban","msg.delete","mute.write","group.write","social.settings","social.friends","push.user","push.all","account.invite","user.read"],"pushTypes":["notice","promo"]}]""")
             Files.setPosixFilePermissions(callers.toPath(), PosixFilePermissions.fromString("rw-------"))
             val pb = ProcessBuilder(bin.absolutePath)
                 .redirectOutput(ProcessBuilder.Redirect.DISCARD)

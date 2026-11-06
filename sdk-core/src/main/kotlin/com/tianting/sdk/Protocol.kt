@@ -156,7 +156,12 @@ internal data class SyncAck(val messages: List<ServerMessage> = emptyList(), val
 internal data class ConvsAck(val convs: List<ServerConversation> = emptyList(), val truncated: Boolean = false)
 
 @Serializable
-internal data class AuthAck(val userId: String, val serverTime: Long, val mutedUntil: Deadline = Deadline.Absent)
+internal data class AuthAck(
+    val userId: String,
+    val serverTime: Long,
+    val mutedUntil: Deadline = Deadline.Absent,
+    val recoveryCodeUnacked: Boolean = false,
+)
 
 /** ack 的 error。details 原样透传（4031 的 {scope, groupId?, mutedUntil}，建群失败的 userId）。 */
 @Serializable

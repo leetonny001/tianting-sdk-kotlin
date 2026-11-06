@@ -25,7 +25,7 @@ private fun categorize(code: Int): ErrorCategory = when (code / 10) {
 }
 
 /** 服务端返回的错误（ack.error）。userId：建群失败时是哪个人（error.userId，兼容 details.userId）。details 原样透传。 */
-public class IMError(
+public open class IMError(
     public val code: Int,
     message: String,
     public val userId: String? = null,

@@ -56,6 +56,15 @@ public sealed interface IMEvent {
 
     /** 被踢或收到不应重连的关闭码，连接已停止，需要回到登录页（C-01）。 */
     public data class Fatal(val reason: FatalReason) : IMEvent
+
+    /** 账号在新设备登录等安全提醒（PRD-chat F-ACC-02 规则 3b）。不认识的 kind 不发。 */
+    public data class SecurityNotice(val kind: String, val at: Long, val platform: String?) : IMEvent
+
+    /** auth ack 说最新一代恢复码没有确认（F-ACC-05 规则 1）：App 强制进保存页。 */
+    public data object RecoveryCodeUnacked : IMEvent
+
+    /** 某人的资料变了，读 displayName（F-ACC-06：自己改昵称后立即显示）。 */
+    public data class ProfileChanged(val userId: String) : IMEvent
 }
 
 public sealed interface SendResult {
@@ -112,6 +121,7 @@ private const val SOCIAL_RETRY_MS = 6_000L // socialFull 限流每 6 秒恢复�
 private const val SOCIAL_PAGE = 500
 private const val USERS_BATCH = 100
 private const val USERS_MERGE_MS = 16L
+private val SECURITY_NOTICE_KINDS = setOf("newDeviceLogin") // 这一批认识的 securityNotice（server/internal/protocol/frames.go）
 private const val MAX_SAFE_INTEGER = 9007199254740991L // 打开未知会话时的 beforeSeq，与 sdk-ts 相同
 
 /**
@@ -166,6 +176,8 @@ public class IMClient(private val o: IMClientOptions) {
     private val groupInfoInFlight = HashMap<String, Boolean>()
     private var wipedByFatal = false
     private var closed = false
+    private var provider: TokenProvider? = null
+    private var unsubscribeProvider: List<() -> Unit> = emptyList()
 
     private val _state = MutableStateFlow(ConnState.DISCONNECTED)
     private val _banner = MutableStateFlow(false)
@@ -240,6 +252,7 @@ public class IMClient(private val o: IMClientOptions) {
         random = o.random,
         t = t,
         post = { fn -> scope.launch { guard(fn) } },
+        launch = { block -> launchNow(block) },
         listener = object : ConnectionListener {
             override fun onState(state: ConnState) = this@IMClient.onState(state)
             override fun onConnected(ack: AuthAck) = launchNow { this@IMClient.onConnected(ack) }.let { }
@@ -279,25 +292,73 @@ public class IMClient(private val o: IMClientOptions) {
     /** 当前的推送游标（已交付的最大连续序号）。没有登录过，或者 pushStart=LATEST 还没拿到最新序号时为 null。 */
     public fun pushCursor(): Long? = pushSync.cursor
 
-    /** 开始连接。token 只放在第一帧 auth 里（C-52）。 */
+    /** 开始连接（演示模式）。token 只放在第一帧 auth 里（C-52）。 */
     public fun connect(token: String) {
         post {
             _fatal.value = null
+            bindProvider(null)
             conn.start(token)
         }
+    }
+
+    /**
+     * 账号模式：传 AccountClient.tokenProvider。自动刷新、换 token 重连、4011 比较代号（PRD-chat 第 13.1 节，F-ACC-03 规则 5、7）。
+     */
+    public fun connect(tokenProvider: TokenProvider) {
+        post {
+            _fatal.value = null
+            bindProvider(tokenProvider)
+            conn.start(tokenProvider)
+        }
+    }
+
+    private fun bindProvider(p: TokenProvider?) {
+        if (p === provider) return
+        unsubscribeProvider.forEach { it() }
+        provider = p
+        unsubscribeProvider = if (p == null) {
+            emptyList()
+        } else {
+            listOf(
+                p.onEnded { e -> post { if (provider === p) onSessionEnded(e) } },
+                p.onProfileChanged { userId, nickname ->
+                    post {
+                        profiles.put((profiles.last(userId) ?: UserProfile(userId)).copy(nickname = nickname))
+                        emit(IMEvent.ProfileChanged(userId))
+                    }
+                },
+            )
+        }
+    }
+
+    /** 账号会话结束：退出时清空数据（同 disconnect）；其他情况和被踢一样回登录页。来自踢线的，连接已经发过 Fatal。 */
+    private fun onSessionEnded(e: SessionEnd) {
+        if (e.fromKick) return
+        bindProvider(null)
+        conn.stop()
+        if (e.action == SessionEndAction.LOGOUT) {
+            wipeAfterLogout()
+            return
+        }
+        onFatal(FatalReason.Session(e))
     }
 
     /** 退出登录：以 1000 关闭，不再重连，清空内存和本地库（PRD F-AUTH-05、FE-131）。 */
     public suspend fun disconnect() {
         onSdk {
+            bindProvider(null)
             conn.stop()
-            reset()
-            local?.let { db -> dbSafe { db.wipeAll() } }
-            local?.paused = false
-            wipedByFatal = false
-            self = ""
-            _userId.value = ""
+            wipeAfterLogout()
         }
+    }
+
+    private fun wipeAfterLogout() {
+        reset()
+        local?.let { db -> dbSafe { db.wipeAll() } }
+        local?.paused = false
+        wipedByFatal = false
+        self = ""
+        _userId.value = ""
     }
 
     /** 释放 SDK：断开连接（不清本地库，下次启动还能恢复）、关闭本地库、结束 SDK 线程。之后这个对象不能再用。 */
@@ -305,6 +366,7 @@ public class IMClient(private val o: IMClientOptions) {
         onSdk {
             if (closed) return@onSdk
             closed = true
+            bindProvider(null)
             conn.stop()
             local?.close()
         }
@@ -448,6 +510,7 @@ public class IMClient(private val o: IMClientOptions) {
     /** App 前后台变化时调用。 */
     public fun visibilityChanged() {
         post {
+            if (o.isVisible()) provider?.foreground()
             maybeReportRead()
             expireMutes() // 休眠后定时器可能晚到
         }
@@ -885,6 +948,10 @@ public class IMClient(private val o: IMClientOptions) {
         self = a.userId
         _userId.value = a.userId
         serverOffset = a.serverTime - clock.now()
+        if (a.recoveryCodeUnacked) {
+            provider?.recoveryCodeUnacked()
+            emit(IMEvent.RecoveryCodeUnacked)
+        }
         local?.let { db ->
             db.paused = false
             db.setOwner(a.userId)
@@ -997,6 +1064,11 @@ public class IMClient(private val o: IMClientOptions) {
 
     private fun onEvent(ev: JsonObject) {
         when (string(ev, "type")) {
+            "securityNotice" -> {
+                val kind = string(ev, "kind")
+                val at = (ev["at"] as? JsonPrimitive)?.takeIf { !it.isString }?.longOrNull
+                if (kind in SECURITY_NOTICE_KINDS && at != null) emit(IMEvent.SecurityNotice(kind!!, at, string(ev, "platform")))
+            }
             "convAdded" -> {
                 val conv = ImJson.decodeFromJsonElement(ServerConversation.serializer(), ev["conv"] ?: return)
                 store.upsertConversation(conv)
@@ -1226,6 +1298,7 @@ public class IMClient(private val o: IMClientOptions) {
      * 内存里的消息留给界面显示，下次同一账号登录时再写回本地库。
      */
     private fun onFatal(r: FatalReason) {
+        bindProvider(null)
         clearSocial()
         for (c in allConvIds()) failPending(c)
         local?.let { db ->

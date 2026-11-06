@@ -1,5 +1,6 @@
 package com.tianting.sdk
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
@@ -18,9 +19,23 @@ public enum class ConnState { DISCONNECTED, CONNECTING, CONNECTED }
 
 /** 连接不再自动重连的原因：被踢（kicked 事件），或者收到不应重连的关闭码（1000、4009～4012、4429）。 */
 public sealed interface FatalReason {
-    /** until 只在 reason = suspended 时有意义：封禁到期时间（毫秒），永久为 null。 */
-    public data class Kicked(val reason: String, val code: Int, val until: Long? = null) : FatalReason
-    public data class Closed(val code: Int, val reason: String) : FatalReason
+    /**
+     * until 只在 reason = suspended 时有意义：封禁到期时间（毫秒），永久为 null。
+     * recoverBefore：找回截止日期（PRD-chat F-ACC-03 规则 6a），有就提示这个日期，用 sessionDialogText。
+     */
+    public data class Kicked(val reason: String, val code: Int, val until: Long? = null, val recoverBefore: Long? = null) : FatalReason
+
+    /** 按关闭码结束。不是 data class：Session 要继承它，现有 App 里 `when (r) { is Kicked; is Closed }` 不用改也能编译。 */
+    public open class Closed(public val code: Int, public val reason: String) : FatalReason {
+        override fun equals(other: Any?): Boolean =
+            other is Closed && other.javaClass == javaClass && other.code == code && other.reason == reason
+
+        override fun hashCode(): Int = 31 * code + reason.hashCode()
+        override fun toString(): String = "Closed(code=$code, reason=$reason)"
+    }
+
+    /** 账号会话结束（connect(tokenProvider)）：刷新得到 4019，或者 access 到达绝对上限。要显示的文字用 sessionDialogText(end.dialog, end.recoverBefore)。 */
+    public data class Session(val end: SessionEnd) : Closed(end.code ?: 0, end.reason ?: "")
 }
 
 public data class IMClientTimings(
@@ -67,6 +82,8 @@ internal class Connection(
     private val random: () -> Double,
     private val t: IMClientTimings,
     private val post: (() -> Unit) -> Unit,
+    /** 在 SDK 线程上开始一段挂起的工作（等 token 来源）。 */
+    private val launch: (suspend () -> Unit) -> Unit,
     private val listener: ConnectionListener,
 ) {
     private var token = ""
@@ -82,6 +99,10 @@ internal class Connection(
     private var authTimer: Timer? = null
     private var kickedReason: String? = null
     private var kickedUntil: Long? = null
+    private var kickedRecoverBefore: Long? = null
+    private var provider: TokenProvider? = null
+    private var unsubscribeToken: (() -> Unit)? = null
+    private var rejectStreak = 0 // 连续被 4011 拒绝的次数：第一次立即重连，再来按退避，防止和服务端打转
     private var reqN = 0
     private var authId = ""
     private val pending = LinkedHashMap<String, Pending>()
@@ -95,13 +116,48 @@ internal class Connection(
         var timedOut = false
     }
 
-    /** 开始连接（已经在连接或已连接时只更新 token）。 */
+    /** 开始连接（已经在连接或已连接时只更新 token）。演示模式，行为不变。 */
     fun start(token: String) {
+        setProvider(null)
         this.token = token
+        begin()
+    }
+
+    /** 账号模式（PRD-chat F-ACC-03 规则 5、7）：拨号前向 token 来源要 token，token 换了重连，4011 比较代号。 */
+    fun start(p: TokenProvider) {
+        setProvider(p)
+        begin()
+    }
+
+    private fun begin() {
         if (active) return
         active = true
         attempt = 0
+        rejectStreak = 0
         dial()
+    }
+
+    private fun setProvider(p: TokenProvider?) {
+        if (p === provider) return
+        unsubscribeToken?.invoke()
+        provider = p
+        val me = p
+        unsubscribeToken = p?.onTokenChanged { post { if (provider === me) onTokenChanged() } }
+    }
+
+    /** token 换了（规则 5）：已有连接用 1000 断开，立即用新 token 重连；在等退避的不用等了。 */
+    private fun onTokenChanged() {
+        if (!active) return
+        val c = conn
+        if (c != null) {
+            teardown()
+            c.close(1000, "token rotated")
+            setState(ConnState.DISCONNECTED)
+            dial()
+        } else if (reconnectTimer != null) {
+            clearReconnect()
+            dial()
+        }
     }
 
     /** 主动退出：以 1000 关闭，不再重连（PRD F-AUTH-05）。 */
@@ -113,6 +169,7 @@ internal class Connection(
         teardown()
         c?.close(1000, "logout")
         setState(ConnState.DISCONNECTED)
+        setProvider(null)
     }
 
     /** 网络恢复：正在等待退避时立即重连（PRD F-CONN-01 规则 3）。 */
@@ -151,7 +208,36 @@ internal class Connection(
         val gen = ++connGen
         kickedReason = null
         kickedUntil = null
+        kickedRecoverBefore = null
         setState(ConnState.CONNECTING)
+        val p = provider
+        if (p == null) {
+            openSocket(gen)
+            return
+        }
+        // 启动已过期时这里会先刷新（规则 5）。会话结束时不用在这里处理：IMClient 从 onEnded 收到。
+        launch {
+            val fresh = try {
+                p.accessToken()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                log.debug("im: no token, session ended")
+                null
+            }
+            // 也经过 post：排在"token 换了"的通知后面，否则那个通知会把刚拨的连接断开重拨。
+            if (fresh != null) {
+                post {
+                    if (gen == connGen && active) {
+                        token = fresh
+                        openSocket(gen)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun openSocket(gen: Int) {
         val fullUrl = "$url?platform=${URLEncoder.encode(platform.wire, "UTF-8")}"
         conn = transport.open(
             fullUrl,
@@ -205,6 +291,7 @@ internal class Connection(
                     // 先记下原因，等随后的关闭码到达时统一处理。
                     kickedReason = (ev["reason"] as? JsonPrimitive)?.contentOrNull ?: ""
                     kickedUntil = (ev["until"] as? JsonPrimitive)?.takeIf { it !is JsonNull }?.longOrNull
+                    kickedRecoverBefore = (ev["recoverBefore"] as? JsonPrimitive)?.takeIf { !it.isString }?.longOrNull
                     return
                 }
                 listener.onFrame(InboundFrame(cmd, f["data"]))
@@ -237,6 +324,7 @@ internal class Connection(
                 return
             }
             attempt = 0
+            rejectStreak = 0
             setState(ConnState.CONNECTED)
             scheduleHeartbeat()
             listener.onConnected(ack)
@@ -276,17 +364,23 @@ internal class Connection(
     }
 
     private fun onClosed(code: Int, reason: String) {
-        val kicked = kickedReason
+        // 不认识的踢线原因（PRD-chat F-ACC-04 规则 5，PRD-core 3.1 节）：关闭码说可以重连就忽略它；否则按关闭码结束，原因原样告诉界面。
+        val raw = kickedReason
+        val known = raw != null && raw in KICK_CLOSE_CODE
+        val kicked = if (raw != null && (known || CLOSE_RECONNECT[code] == false)) raw else null
+        if (raw != null && !known) log.warn("im: unknown kick reason, close code $code")
         val until = kickedUntil
+        val recoverBefore = kickedRecoverBefore
         teardown()
         setState(ConnState.DISCONNECTED)
         if (!active) return
 
+        val p = provider
+        if (p != null && onClosedWithProvider(p, kicked, known, code, until, recoverBefore)) return
+
         // 被踢不重连（PRD F-AUTH-03 规则 4），例外：服务端下线按退避重连（C-55）。
         if (kicked != null && kicked != "serverShutdown") {
-            active = false
-            token = ""
-            listener.onFatal(FatalReason.Kicked(kicked, code, until))
+            emitKicked(kicked, code, until, recoverBefore)
             return
         }
         // 1000、4009～4012、4429 不重连；未列出的关闭码（1006 等）按可以重连处理。
@@ -297,6 +391,71 @@ internal class Connection(
             return
         }
         scheduleReconnect()
+    }
+
+    private fun emitKicked(reason: String, code: Int, until: Long?, recoverBefore: Long?) {
+        active = false
+        token = ""
+        listener.onFatal(FatalReason.Kicked(reason, code, until, recoverBefore))
+    }
+
+    /** 账号模式的关闭：4011 走规则 7；4010、4012 让账号会话决定（改密进行中要缓存，F-ACC-04 规则 3）。返回 true 表示处理完了。 */
+    private fun onClosedWithProvider(p: TokenProvider, kicked: String?, known: Boolean, code: Int, until: Long?, recoverBefore: Long?): Boolean {
+        if (kicked == "tokenExpired" || (!known && code == 4011)) {
+            onTokenRejected(p)
+            return true
+        }
+        if (kicked == "serverShutdown") return false
+        if (!known && code != 4010 && code != 4012) return false
+        val info = KickInfo(if (known) kicked else null, code, recoverBefore, lineageOf(token).sid)
+        val gen = connGen
+        launch {
+            val d = try {
+                p.kickReceived(info)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                KickDecision.PASS
+            }
+            if (gen == connGen && active && provider === p) {
+                if (d == KickDecision.IGNORE) {
+                    dial() // 旧 sid 的踢线：token 已经换好了，立即重连，1 秒内不显示提示
+                } else if (kicked != null) {
+                    emitKicked(kicked, code, until, recoverBefore)
+                } else {
+                    active = false
+                    token = ""
+                    listener.onFatal(FatalReason.Closed(code, ""))
+                }
+            }
+        }
+        return true
+    }
+
+    /** 规则 7：等 token 来源给出新的（本地更新就立刻，否则刷新一次），然后重连。会话结束时 IMClient 从 onEnded 收到。 */
+    private fun onTokenRejected(p: TokenProvider) {
+        val gen = connGen
+        val rejected = token
+        rejectStreak += 1
+        launch {
+            val ok = try {
+                p.tokenRejected(rejected)
+                true
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                log.debug("im: token rejected, session ended")
+                false
+            }
+            // 也经过 post：排在"token 换了"的通知后面，否则那个通知会把刚拨的连接断开，或者提前退避。
+            if (ok) {
+                post {
+                    if (gen == connGen && active && provider === p) {
+                        if (rejectStreak <= 1) dial() else if (reconnectTimer == null) scheduleReconnect()
+                    }
+                }
+            }
+        }
     }
 
     /** 退避：1s、2s、4s… 最长 30s（上限是加抖动之前的值，C-22），再加 ±jitter。 */
@@ -341,6 +500,7 @@ internal class Connection(
     private fun setState(s: ConnState) {
         if (s == state) return
         state = s
+        provider?.connectionChanged(s == ConnState.CONNECTED)
         listener.onState(s)
     }
 }
