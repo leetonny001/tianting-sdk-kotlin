@@ -139,7 +139,7 @@ im.events.collect { if (it is IMEvent.FilesExpired) imageCache.remove(it.fileIds
 ```
 
 状态：`PROCESSING` → `UPLOADING` → `QUEUED`（待发送，已 complete）→ `SENDING` → `SENT`，任何一步可以 `FAILED`。
-冷启动时处理中、上传中的转失败（`SendError.Network`），不自动上传。`SendError`：`Code`（4292、4290 + `errorReason`、4139、4150、4096、5032）、
+冷启动时处理中、上传中的转失败（`SendError.Network`），不自动上传；待发送的附件（以及已有 `fileId` 的发送中）按排队，连上后自动发 1 次（F-FILE-07 规则 3，问题 D3），其他排队、发送中的消息仍转失败。`AccountClient.updateProfile(avatarFileId = …)` 成功后 `IMClient` 马上重新拉自己的资料（头像地址只有 `users` 能拿到，问题 H13），拿到后发 `ProfileChanged`。`SendError`：`Code`（4292、4290 + `errorReason`、4139、4150、4096、5032）、
 `Network`、`Process`、`Storage`、`SourceMissing`、`Timeout`、`Kicked`。本地库第 2 版（加 `attachments`、`mod_vers` 表），第 1 版原地升级。
 重连时只重拉 `modVer` 变了的会话（服务端没有 `modVer` 时全部重拉），基线存本地库；`deleted`、`expired` 只能从假变真。
 预签名地址和文件名不进日志，地址不持久化；`OkHttpObjectTransport` 不装日志拦截器、不重试、不跟随重定向。

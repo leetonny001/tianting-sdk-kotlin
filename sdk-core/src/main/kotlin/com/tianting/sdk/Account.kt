@@ -337,7 +337,7 @@ public class AccountClient(private val o: AccountClientOptions) : FileAuth {
     private var lifeTimer: Timer? = null
     private val tokenListeners = CopyOnWriteArraySet<() -> Unit>()
     private val endedListeners = CopyOnWriteArraySet<(SessionEnd) -> Unit>()
-    private val profileListeners = CopyOnWriteArraySet<(String, String) -> Unit>()
+    private val profileListeners = CopyOnWriteArraySet<(String, ProfileChange) -> Unit>()
 
     private val memoryPending = ArrayList<PendingLogout>() // 没有 pendingLogoutStore 时
     private var flushing = false
@@ -374,7 +374,7 @@ public class AccountClient(private val o: AccountClientOptions) : FileAuth {
         override fun foreground() = this@AccountClient.foreground()
         override fun onTokenChanged(listener: () -> Unit): () -> Unit = subscribe(tokenListeners, listener)
         override fun onEnded(listener: (SessionEnd) -> Unit): () -> Unit = subscribe(endedListeners, listener)
-        override fun onProfileChanged(listener: (String, String) -> Unit): () -> Unit = subscribe(profileListeners, listener)
+        override fun onProfileChanged(listener: (String, ProfileChange) -> Unit): () -> Unit = subscribe(profileListeners, listener)
         override fun recoveryCodeUnacked() = post { emit(AccountEvent.RecoveryCodeUnacked) }
     }
 
@@ -1103,7 +1103,8 @@ public class AccountClient(private val o: AccountClientOptions) : FileAuth {
             },
         )
         val userId = session_?.userId
-        if (userId != null && nickname != null) for (fn in profileListeners) guard { fn(userId, nickname) }
+        // 头像地址由服务端生成，响应里没有：IMClient 收到后重新拉自己的资料（问题 H13）。
+        if (userId != null && (nickname != null || avatarFileId != null)) for (fn in profileListeners) guard { fn(userId, ProfileChange(nickname, avatarFileId != null)) }
     }
 
     /** 最近登录记录和其他会话数量。 */

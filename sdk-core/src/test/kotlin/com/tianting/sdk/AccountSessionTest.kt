@@ -6,6 +6,7 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
@@ -1506,6 +1507,44 @@ class AccountSessionTest : AccountTest() {
         a.h.start { getUsers(listOf("bobby")) }
         a.clock.advance(16)
         assertEquals(2, c.frames("users").size)
+    }
+
+    @Test
+    fun `H13 改头像：PATCH 成功后马上重新拉自己的资料，缓存里是服务端的新地址，通知 App；只改昵称不重新拉`() {
+        val a = setupAccount()
+        a.session(1, DAY)
+        val c = a.online()
+        val p = a.start { updateProfile(avatarFileId = "F9") }
+        assertEquals(jsonOf("""{"avatarFileId":"F9"}"""), a.http.last("/v1/account/profile").json)
+        a.http.last("/v1/account/profile").respond(200)
+        a.await(p)
+        val users = c.frames("users")
+        assertEquals(1, users.size, "改头像后重新拉自己的资料")
+        assertEquals(listOf(USER), users[0].dataObj["userIds"]!!.jsonArray.map { it.str })
+        c.ack("users", obj("users" to listOf(obj("userId" to USER, "nickname" to "我", "avatar" to "https://pub.test/a/new.jpg"))))
+        assertEquals("https://pub.test/a/new.jpg", a.h.call { profileOf(USER) }?.avatar)
+        assertEquals(listOf(USER), a.h.events.filterIsInstance<IMEvent.ProfileChanged>().map { it.userId })
+
+        val q = a.start { updateProfile(nickname = "小明") }
+        a.http.last("/v1/account/profile").respond(200)
+        a.await(q)
+        assertEquals(1, c.frames("users").size, "只改昵称：昵称在本地就有，不重新拉")
+    }
+
+    @Test
+    fun `H13 改头像时没有连接：连上后重新拉自己的资料`() {
+        val a = setupAccount()
+        a.session(1, DAY)
+        val c = a.online()
+        c.drop(1006)
+        val p = a.start { updateProfile(avatarFileId = "F9") }
+        a.http.last("/v1/account/profile").respond(200)
+        a.await(p)
+        assertEquals(0, c.frames("users").size)
+        a.clock.advance(1_000)
+        val c2 = a.authNew()
+        val mine = c2.frames("users").filter { f -> f.dataObj["userIds"]!!.jsonArray.map { it.str } == listOf(USER) }
+        assertEquals(1, mine.size, "连上后重新拉")
     }
 
     // ---- TC-ACC-02-13 ----

@@ -447,6 +447,66 @@ class FilesTest : AccountTest() {
         assertEquals(emptyList(), b.sandbox())
     }
 
+    private fun restartable(dbDir: File, root: File, at: Long) =
+        AccountHarness(setup(database = JdbcLocalDatabase(File(dbDir, "im.db")), clock = com.tianting.sdk.testing.FakeClock(at), timings = IMClientTimings(heartbeatMs = 10 * 365 * DAY), filesRoot = root)).also { made.add(it) }
+
+    @Test
+    fun `D3 冷启动：待发送的附件按排队，连上后自动发 1 次，同一 clientMsgId，不重新上传；排队的文字照旧转失败（F-FILE-07 规则 3）`() {
+        val dbDir = File(tmp, "db").apply { mkdirs() }
+        val root = File(tmp, "root")
+        val a = restartable(dbDir, root, START_MS)
+        a.session(1, DAY)
+        val c = a.online()
+        a.sendImage()
+        a.grant("F1")
+        a.h.objects.pending[0].respond(200)
+        a.h.objects.pending[0].respond(200)
+        c.drop(1006)
+        a.completeOk("F1")
+        a.h.call { send(AB, "离线的文字") }
+        assertEquals(listOf("cid-0001:queued", "cid-0002:queued"), a.status())
+        a.h.call { close() } // 杀进程
+
+        val b = restartable(dbDir, root, START_MS + 60_000)
+        assertEquals(listOf("cid-0001:queued", "cid-0002:failed(timeout)"), b.status())
+        b.session(1, DAY)
+        val c2 = b.online()
+        val sent = c2.frames("send")
+        assertEquals(1, sent.size, "只自动发待发送的附件")
+        assertEquals("cid-0001", sent[0].dataObj["clientMsgId"]!!.str)
+        assertEquals(obj("image" to obj("fileId" to "F1")), sent[0].dataObj["body"])
+        assertEquals(0, b.http.to(UPLOADS).size, "不重新上传")
+        c2.ack("send", obj("msgId" to "m1", "convId" to AB, "seq" to 1, "ts" to 9))
+        assertEquals(listOf("cid-0001:sent#1", "cid-0002:failed(timeout)"), b.status())
+        assertEquals(emptyList(), b.sandbox())
+    }
+
+    @Test
+    fun `D3 冷启动：有 fileId 的发送中（send 没有 ack）同样按排队自动发 1 次；再断线不再自动发`() {
+        val dbDir = File(tmp, "db").apply { mkdirs() }
+        val root = File(tmp, "root")
+        val a = restartable(dbDir, root, START_MS)
+        a.session(1, DAY)
+        val c = a.online()
+        a.sendImage()
+        a.uploadOk("F1")
+        assertEquals(1, c.frames("send").size)
+        assertEquals(listOf("cid-0001:sending"), a.status())
+        a.h.call { close() }
+
+        val b = restartable(dbDir, root, START_MS + 60_000)
+        assertEquals(listOf("cid-0001:queued"), b.status())
+        b.session(1, DAY)
+        val c2 = b.online()
+        assertEquals(listOf("cid-0001"), c2.frames("send").map { it.dataObj["clientMsgId"]!!.str })
+        c2.drop(1006) // 发出后又断了：已经自动发过 1 次（规则 3 只发 1 次），转失败由用户重发
+        b.clock.advance(1_000)
+        val c3 = b.authNew()
+        assertEquals(0, c3.frames("send").size)
+        assertEquals(listOf("cid-0001:failed(timeout)"), b.status())
+        assertEquals(0, b.http.to(UPLOADS).size)
+    }
+
     @Test
     fun `沙盒副本也没了（文件被删）：重发不上传，error=SourceMissing（原文件已不可用）`() {
         val (a, _) = online()

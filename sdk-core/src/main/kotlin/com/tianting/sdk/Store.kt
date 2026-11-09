@@ -15,7 +15,7 @@ import kotlinx.serialization.json.intOrNull
 /**
  * 发送状态（PRD F-MSG-03；附件见 PRD-chat F-FILE-07）。服务端来的消息都是 SENT。
  * 附件：PROCESSING（App 在处理图片）→ UPLOADING（申请、PUT、complete）→ QUEUED（待发送：已 complete，等连接）→ SENDING → SENT；
- * 任何一步可以转 FAILED。文本没有前两种。冷启动时 PROCESSING、UPLOADING 一律转 FAILED，不自动上传（规则 3）。
+ * 任何一步可以转 FAILED。文本没有前两种。冷启动时 PROCESSING、UPLOADING 一律转 FAILED，不自动上传；有 fileId 的 QUEUED、SENDING 附件按排队自动发 1 次（规则 3，D3）。
  */
 @Serializable
 public enum class MessageStatus { QUEUED, SENDING, SENT, FAILED, PROCESSING, UPLOADING }

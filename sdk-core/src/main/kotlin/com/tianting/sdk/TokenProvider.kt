@@ -29,6 +29,9 @@ public data class SessionEnd(
  * AccountClient.tokenProvider 实现了它。保留的 connect(token) 没有这些行为（演示模式）。
  * 回调可能在别的线程，IMClient 自己切回 SDK 线程。
  */
+/** updateProfile 改了什么：新昵称（没改为 null）；头像是否改了（新地址由服务端生成，要重新拉资料）。 */
+public data class ProfileChange(val nickname: String?, val avatarChanged: Boolean)
+
 public interface TokenProvider {
     /** 拨号前调用。已过期时先刷新再返回；会话结束时抛 SessionEndedError，连接发 Session 类 Fatal（问题 K7）。 */
     public suspend fun accessToken(): String
@@ -50,8 +53,8 @@ public interface TokenProvider {
 
     public fun onEnded(listener: (SessionEnd) -> Unit): () -> Unit
 
-    /** 账号资料改了（F-ACC-06）：本端立即显示新昵称。 */
-    public fun onProfileChanged(listener: (userId: String, nickname: String) -> Unit): () -> Unit
+    /** 账号资料改了（F-ACC-06）：本端立即显示新昵称；改了头像时 IMClient 重新拉自己的资料（问题 H13）。 */
+    public fun onProfileChanged(listener: (userId: String, change: ProfileChange) -> Unit): () -> Unit
 
     /** 服务端说最新一代恢复码没有确认（F-ACC-05 规则 1）。 */
     public fun recoveryCodeUnacked()

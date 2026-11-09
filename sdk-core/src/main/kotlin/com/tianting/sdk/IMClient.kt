@@ -187,6 +187,7 @@ public class IMClient(private val o: IMClientOptions) {
     private var serverOffset = 0L // 服务端时间 − 本地时间（auth ack 的 serverTime）
 
     private val autoUsed = HashSet<String>() // 已经自动重发过一次的 clientMsgId
+    private val pendingProfileRefetch = LinkedHashSet<String>() // 改资料时没有连接：连上后重新拉（问题 H13）
     private val gapTimers = HashMap<String, Timer>()
     private var active: String? = null
     private var lastRead = Long.MIN_VALUE / 2
@@ -368,10 +369,15 @@ public class IMClient(private val o: IMClientOptions) {
         } else {
             listOf(
                 p.onEnded { e -> post { if (provider === p) onSessionEnded(e) } },
-                p.onProfileChanged { userId, nickname ->
+                p.onProfileChanged { userId, change ->
                     post {
-                        profiles.put((profiles.last(userId) ?: UserProfile(userId)).copy(nickname = nickname))
-                        emit(IMEvent.ProfileChanged(userId))
+                        val nickname = change.nickname
+                        if (nickname != null) {
+                            profiles.put((profiles.last(userId) ?: UserProfile(userId)).copy(nickname = nickname))
+                            emit(IMEvent.ProfileChanged(userId))
+                        }
+                        // 头像地址由服务端生成，PATCH 的响应里没有，只有 users 能拿到：马上重新拉一次自己的资料（问题 H13）。
+                        if (change.avatarChanged && provider === p) launchNow { refetchProfile(userId) }
                     }
                 },
             )
@@ -1148,6 +1154,25 @@ public class IMClient(private val o: IMClientOptions) {
         ids.mapNotNull { profiles.fresh(it) }
     }
 
+    /**
+     * 自己改了资料之后重新拉一次（问题 H13）：不看缓存有效期。没有连接时等连上再拉（这期间先显示本地的新昵称）。
+     * 拿到后通知 App（ProfileChanged）；失败只记日志，之后照常按 10 分钟缓存刷新。
+     */
+    private suspend fun refetchProfile(userId: String) {
+        if (conn.state != ConnState.CONNECTED) {
+            pendingProfileRefetch.add(userId)
+            return
+        }
+        try {
+            val ack = req("users", buildJsonObject { put("userIds", buildJsonArray { add(JsonPrimitive(userId)) }) }, UsersAck.serializer())
+            ack.users.firstOrNull { it.userId == userId }?.let { profiles.put(it) }
+            emit(IMEvent.ProfileChanged(userId))
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            log.warn("im: profile refetch failed: ${safeDescribe(e)}")
+        }
+    }
+
     private suspend fun flushUsers() {
         val queue = usersQueue
         usersQueue = LinkedHashMap()
@@ -1391,15 +1416,20 @@ public class IMClient(private val o: IMClientOptions) {
             // 上次进程结束时还没发出去的消息：标记失败，由用户决定是否重发（不在用户不知情时发出旧消息）。
             val unsentToFail = ArrayList<Message>()
             for (m in r.messages) {
-                val pending = m.seq == null && (m.status == MessageStatus.QUEUED || m.status == MessageStatus.SENDING)
+                val unsent = m.seq == null && (m.status == MessageStatus.QUEUED || m.status == MessageStatus.SENDING)
+                // 待发送的附件（已 complete，有 fileId），以及有 fileId 的发送中：按排队，连上后自动发 1 次（F-FILE-07 规则 3，
+                // 问题 D3 按 PRD 字面统一，同 sdk-swift；服务端按 clientMsgId 去重）。其他排队、发送中的规则不变。
+                val readyAttachment = unsent && (m.type == MsgType.IMAGE || m.type == MsgType.FILE) && !m.body.fileId.isNullOrEmpty()
+                val pending = unsent && !readyAttachment
                 // 处理中、上传中被进程结束打断（F-FILE-07 规则 3）：一律失败，不自动上传，点重发用沙盒副本从头传。
                 val interrupted = m.seq == null && (m.status == MessageStatus.PROCESSING || m.status == MessageStatus.UPLOADING)
                 val fixed = when {
+                    readyAttachment -> m.copy(status = MessageStatus.QUEUED, error = null, errorReason = null)
                     pending -> m.copy(status = MessageStatus.FAILED, error = SendError.Timeout)
                     interrupted -> m.copy(status = MessageStatus.FAILED, error = SendError.Network)
                     else -> m
                 }
-                if (pending || interrupted) unsentToFail.add(fixed)
+                if (pending || interrupted || (readyAttachment && fixed != m)) unsentToFail.add(fixed)
                 store.restoreMessage(fixed)
             }
             for (a in r.attachments) sources[a.clientMsgId] = Source(a, null, null)
@@ -1466,6 +1496,11 @@ public class IMClient(private val o: IMClientOptions) {
         }
         wipedByFatal = false
         pushSync.onAuth(a.userId, a.serverTime) // 不等 convs、socialSync，互不阻塞（AC-PUSH-03-24）
+        if (pendingProfileRefetch.isNotEmpty()) {
+            val ids = pendingProfileRefetch.toList()
+            pendingProfileRefetch.clear()
+            for (id in ids) if (id == a.userId) launchNow { refetchProfile(id) }
+        }
         store.transaction { social.purgeOldRequests(serverNow()) }
         mutes.setUser(a.mutedUntil) // 没有这个字段表示没有用户级禁言（离线期间可能已经解除）
         mutesChanged()
@@ -2037,6 +2072,7 @@ public class IMClient(private val o: IMClientOptions) {
         clearSocial()
         knownLists.clear()
         autoUsed.clear()
+        pendingProfileRefetch.clear()
         clearFileState(deleteDirs = false)
         active = null
         lastRead = Long.MIN_VALUE / 2
