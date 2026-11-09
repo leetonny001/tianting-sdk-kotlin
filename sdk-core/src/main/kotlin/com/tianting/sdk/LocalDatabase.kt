@@ -64,6 +64,11 @@ internal data class AttachmentRecord(
     val height: Int? = null,
     /** 原文件、缩略图已经复制进沙盒。处理中被打断的没有。 */
     val copied: Boolean = false,
+    /**
+     * 这台设备上传、complete 成功得到的 fileId（F-FILE-07 规则 4，v1.4，P-37 ①）：send 回 4048 时只有它按"已清理"处理。
+     * 跨冷启动保留（json 列，旧行没有这个字段按 null 解码）。
+     */
+    val uploadedFileId: String? = null,
 )
 
 /**

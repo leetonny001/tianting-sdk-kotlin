@@ -832,6 +832,9 @@ public class IMClient(private val o: IMClientOptions) {
             if (!alive()) return
             val done = f.complete(up.fileId)
             j.completed = true
+            // 记下"这台设备自己上传的 fileId"（规则 4）：之后 send 回 4048 才按已清理重新上传。
+            src.rec = src.rec.copy(uploadedFileId = done.fileId)
+            if (sources[id] === src) local?.saveAttachment(src.rec)
             if (!alive()) return
             store.list(convId).update(id) { m ->
                 val body = if (rec.kind == "image") {
@@ -882,7 +885,18 @@ public class IMClient(private val o: IMClientOptions) {
     }
 
     /**
-     * send 返回 4096（文件超过 24 小时被清理）：有沙盒副本的回到上传中、从头上传，不算自动重发次数（RC2-23）；
+     * send 的错误是不是"文件已被清理"（F-FILE-07 规则 4）：4096；或者 4048 且 fileId 是这台设备自己上传得到的
+     * （24 小时没绑定的上传被 file_purge 删了行，服务端分不清，v1.4，P-37 ①）。别人的 fileId（转发等）回 4048 照常失败。
+     */
+    private fun purgedOnServer(code: Int, clientMsgId: String, m: Message): Boolean {
+        if (code == ErrorCode.FILE_NOT_READY) return true
+        if (code != ErrorCode.FILE_NOT_FOUND) return false
+        val fileId = m.body.fileId
+        return !fileId.isNullOrEmpty() && sources[clientMsgId]?.rec?.uploadedFileId == fileId
+    }
+
+    /**
+     * send 返回 4096（文件超过 24 小时被清理），或自己上传的 fileId 返回 4048：有沙盒副本的回到上传中、从头上传，不算自动重发次数（RC2-23）；
      * 没有的转失败，error=SourceMissing（F-FILE-07 规则 4，AC-FILE-07-10）。
      */
     private fun reupload(convId: String, clientMsgId: String) {
@@ -1943,7 +1957,7 @@ public class IMClient(private val o: IMClientOptions) {
                 // 失败回调是异步的：这期间消息可能已经被别的路径改过状态（例如被踢时标记为失败），只处理仍在发送中的。
                 if (e is IMError && e.code == ErrorCode.MUTED) onMutedAck(e.details)
                 if (list.local(clientMsgId)?.status != MessageStatus.SENDING) return@launchNow
-                if (e is IMError && e.code == ErrorCode.FILE_NOT_READY && (type == MsgType.IMAGE || type == MsgType.FILE)) {
+                if (e is IMError && (type == MsgType.IMAGE || type == MsgType.FILE) && purgedOnServer(e.code, clientMsgId, list.local(clientMsgId)!!)) {
                     reupload(convId, clientMsgId)
                     return@launchNow
                 }

@@ -384,6 +384,104 @@ class FilesTest : AccountTest() {
         assertEquals("cid-0001", c2.last("send").dataObj["clientMsgId"]!!.str)
     }
 
+    // ---- TC-FILE-07-10：send 返回 4048（v1.4，P-37 ①）只对这台设备自己上传的 fileId 按已清理处理 ----
+
+    @Test
+    fun `TC-FILE-07-10 自己上传的图片 send 返回 4048：用沙盒副本重新上传（新 fileId），clientMsgId 不变，成功后副本删除`() {
+        val (a, c) = online()
+        a.sendImage()
+        a.uploadOk("F1")
+        c.ackError("send", 4048)
+        assertEquals(listOf("cid-0001:uploading"), a.status())
+        assertEquals("", a.im.messages(AB)[0].body.image!!.fileId)
+        assertEquals(2, a.http.to(UPLOADS).size) // 重新申请上传
+        a.uploadOk("F2")
+        assertEquals("cid-0001", c.last("send").dataObj["clientMsgId"]!!.str)
+        assertEquals(obj("image" to obj("fileId" to "F2")), c.last("send").dataObj["body"])
+        c.ack("send", obj("msgId" to "m1", "convId" to AB, "seq" to 1, "ts" to 9))
+        assertEquals(listOf("cid-0001:sent#1"), a.status())
+        assertEquals(emptyList(), a.sandbox())
+    }
+
+    @Test
+    fun `TC-FILE-07-10 自己上传的文件 send 返回 4048：重新上传，不占自动重发次数（断线后还会自动补发一次）`() {
+        val (a, c) = online()
+        a.h.call { sendFile(AB, FileInput(tmpFile(10), SECRET_NAME, "application/pdf")) }
+        a.uploadOk("F1", thumb = false)
+        c.ackError("send", 4048)
+        assertEquals(listOf("cid-0001:uploading"), a.status())
+        a.uploadOk("F2", thumb = false)
+        assertEquals(obj("file" to obj("fileId" to "F2")), c.last("send").dataObj["body"])
+        c.drop(1006)
+        assertEquals(listOf("cid-0001:queued"), a.status())
+        a.clock.advance(1_000)
+        val c2 = a.authNew()
+        assertEquals("cid-0001", c2.last("send").dataObj["clientMsgId"]!!.str)
+    }
+
+    @Test
+    fun `TC-FILE-07-10 冷启动后仍认得自己上传的 fileId：自动发的那次回 4048，用沙盒副本重新上传后成功`() {
+        val dbDir = File(tmp, "db").apply { mkdirs() }
+        val root = File(tmp, "root")
+        val a = restartable(dbDir, root, START_MS)
+        a.session(1, DAY)
+        a.online()
+        a.sendImage()
+        a.uploadOk("F1") // send 没有 ack
+        a.h.call { close() }
+
+        val b = restartable(dbDir, root, START_MS + 25 * HOUR)
+        assertEquals(listOf("cid-0001:queued"), b.status())
+        b.session(1, 2 * DAY)
+        val c = b.online()
+        assertEquals(obj("image" to obj("fileId" to "F1")), c.last("send").dataObj["body"])
+        c.ackError("send", 4048)
+        assertEquals(listOf("cid-0001:uploading"), b.status())
+        b.uploadOk("F2")
+        assertContentEquals(ByteArray(1000) { 1 }, b.h.objects.puts[0].bytes) // 沙盒副本的内容
+        c.ack("send", obj("msgId" to "m1", "convId" to AB, "seq" to 1, "ts" to 9))
+        assertEquals(listOf("cid-0001:sent#1"), b.status())
+    }
+
+    @Test
+    fun `TC-FILE-07-10 自己上传的但沙盒副本没了：4048 后转失败 SourceMissing（原文件已不可用），不再申请上传`() {
+        val (a, c) = online()
+        a.sendImage()
+        a.uploadOk("F1")
+        a.h.attachmentDir.listFiles()!!.forEach { it.deleteRecursively() }
+        c.ackError("send", 4048)
+        assertEquals(listOf("cid-0001:failed(sourceMissing)"), a.status())
+        assertEquals(1, a.http.to(UPLOADS).size)
+    }
+
+    @Test
+    fun `TC-FILE-07-10 别人的 fileId（本地库里有、不是这台设备上传的，例如转发）：4048 照常失败，不重新上传`() {
+        val dbDir = File(tmp, "db").apply { mkdirs() }
+        val root = File(tmp, "root")
+        val a = restartable(dbDir, root, START_MS)
+        a.session(1, DAY)
+        a.online()
+        a.h.call { close() }
+        JdbcLocalDatabase(File(dbDir, "im.db")).use { db ->
+            db.execute(
+                "INSERT INTO messages(conv_id, row_key, seq, json) VALUES(?, 'cfwd-0001', NULL, ?)",
+                listOf(AB, """{"clientMsgId":"fwd-0001","convId":"$AB","from":"$USER","type":"image","body":{"image":{"fileId":"F-OTHER","width":10,"height":10,"size":100,"mime":"image/jpeg"}},"ts":6,"status":"FAILED","error":"timeout"}"""),
+            )
+        }
+
+        val b = restartable(dbDir, root, START_MS + 60_000)
+        assertEquals(listOf("fwd-0001:failed(timeout)"), b.status())
+        b.session(1, DAY)
+        val c = b.online()
+        b.h.call { retry(AB, "fwd-0001") }
+        assertEquals(obj("image" to obj("fileId" to "F-OTHER")), c.last("send").dataObj["body"])
+        c.ackError("send", 4048)
+        assertEquals(listOf("fwd-0001:failed(4048)"), b.status())
+        assertEquals("F-OTHER", b.im.messages(AB)[0].body.image!!.fileId)
+        assertEquals(0, b.http.to(UPLOADS).size)
+        assertEquals(0, b.h.objects.calls.size)
+    }
+
     // ---- 被踢、退出 ----
 
     @Test
