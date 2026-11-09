@@ -1542,6 +1542,7 @@ public class IMClient(private val o: IMClientOptions) {
      * 重连后重拉已加载的范围（F-RCL-03 规则 2）：只重拉 modVer 变了的会话（文件过期等），没变的不拉。
      * 服务端没有 modVer（老服务端）或这次没拿到会话列表时，按原来的做法全部重拉：断开期间被删除的消息
      * 不会再发 msgDeleted，只有 sync 才能拿到（F-ADM-31 规则 5）。基线存在本地库里，冷启动后同样适用。
+     * 按会话依次重拉；一个失败只影响它自己（P-39 ②）：不记新的 modVer，下次重连再拉，其余会话照拉。
      */
     private suspend fun recheckDeleted(convs: List<ServerConversation>?) {
         val byId = convs?.associateBy { it.convId } ?: emptyMap()
@@ -1557,7 +1558,6 @@ public class IMClient(private val o: IMClientOptions) {
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 log.warn("im: recheck deleted failed: ${safeDescribe(e)}")
-                return
             }
         }
     }

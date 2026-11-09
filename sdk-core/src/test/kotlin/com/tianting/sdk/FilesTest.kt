@@ -834,6 +834,28 @@ class FilesTest : AccountTest() {
     }
 
     @Test
+    fun `两个会话都要重拉、AB 失败：G1 照拉并记新 modVer；下次重连只重拉 AB（P-39 ②）`() {
+        val (a, c1) = loaded()
+        c1.drop(1006)
+        a.clock.advance(1_000)
+        val c2 = a.h.login(USER, listOf(conv(AB, maxSeq = 2, modVer = 4), conv(G1, maxSeq = 1, modVer = 8)))
+        assertEquals(AB, c2.last("sync").dataObj["convId"]!!.str)
+        c2.ackError("sync", 5000)
+        // AB 失败不中断：接着对 G1 发 sync
+        assertEquals(G1, c2.last("sync").dataObj["convId"]!!.str)
+        c2.ack("sync", obj("messages" to listOf(img(G1, 1, "G1F", true)), "hasMore" to false))
+        assertTrue(a.im.messages(G1)[0].body.image!!.expired)
+        assertFalse(a.im.messages(AB)[0].body.image!!.expired)
+        assertEquals(listOf(AB, G1), c2.frames("sync").map { it.dataObj["convId"]!!.str })
+        c2.drop(1006)
+        a.clock.advance(1_000)
+        val c3 = a.h.login(USER, listOf(conv(AB, maxSeq = 2, modVer = 4), conv(G1, maxSeq = 1, modVer = 8)))
+        c3.ack("sync", obj("messages" to listOf(img(AB, 1, "F1", true), fileMsg(AB, 2, "F2", true)), "hasMore" to false))
+        assertEquals(listOf(AB), c3.frames("sync").map { it.dataObj["convId"]!!.str })
+        assertTrue(a.im.messages(AB)[0].body.image!!.expired)
+    }
+
+    @Test
     fun `老服务端（convs 没有 modVer）：仍然全部重拉`() {
         val (a, c1) = loaded()
         c1.drop(1006)
