@@ -118,6 +118,32 @@ im.connect(account.tokenProvider)            // 账号模式；connect(token) �
 | HTTP | `OkHttpHttpTransport`：`retryOnConnectionFailure`、重定向都关了，请求体 one-shot，同一个 refresh 不会被隐式多发（`OkHttpRetryTest`）。不要给它装 `HttpLoggingInterceptor` |
 | 凭证 | token、refresh、恢复码不进 URL、日志、异常。`AccountSession` 等的 `toString` 不带它们 |
 
+## 图片和文件（FE-631）
+
+```kotlin
+val im = IMClient(IMClientOptions(
+    url = wsUrl, database = db,
+    files = FileClient(account),                                   // 演示模式：FileClient(StaticTokenAuth(baseUrl, token))
+    attachmentDir = File(context.filesDir, "tianting-attachments"), // 沙盒：发送前复制进来，发出后删除，退出登录清空
+    fileCacheDir = File(context.cacheDir, "tianting-files"),        // 下载缓存，键 fileId + variant
+))
+// 图片处理（压缩、缩略图 ≤ 480、去 EXIF）在 App 里做，写成文件交给 SDK
+val m = im.sendImage(convId, ProcessedImage(LocalFile(jpeg, "image/jpeg"), LocalFile(thumb, "image/jpeg"), w, h)) { sent, total -> }
+im.sendImage(convId, w, h, produce = { withContext(Dispatchers.Default) { process(uri) } }) // 轮到它时才处理（"处理中"）
+im.sendFile(convId, FileInput(copiedFile, name, mime))
+im.cancelUpload(convId, m.clientMsgId)   // 中止上传、发 DELETE、消息消失、删沙盒副本
+im.retry(convId, clientMsgId)            // 已 complete 的复用 fileId；没传完的用沙盒副本从头传；副本不在时 error = SourceMissing
+val urls = im.getFileUrls(listOf(FileUrlItem(fileId, FileVariant.THUMB))) // SDK 线程同一轮合并成一批（≤ 50），地址只在内存
+val file = im.download(fileId, FileVariant.ORIGINAL) { got -> }          // 缓存命中直接返回；失败删部分文件，重试重新申请地址
+im.events.collect { if (it is IMEvent.FilesExpired) imageCache.remove(it.fileIds) }
+```
+
+状态：`PROCESSING` → `UPLOADING` → `QUEUED`（待发送，已 complete）→ `SENDING` → `SENT`，任何一步可以 `FAILED`。
+冷启动时处理中、上传中的转失败（`SendError.Network`），不自动上传。`SendError`：`Code`（4292、4290 + `errorReason`、4139、4150、4096、5032）、
+`Network`、`Process`、`Storage`、`SourceMissing`、`Timeout`、`Kicked`。本地库第 2 版（加 `attachments`、`mod_vers` 表），第 1 版原地升级。
+重连时只重拉 `modVer` 变了的会话（服务端没有 `modVer` 时全部重拉），基线存本地库；`deleted`、`expired` 只能从假变真。
+预签名地址和文件名不进日志，地址不持久化；`OkHttpObjectTransport` 不装日志拦截器、不重试、不跟随重定向。
+
 ## 开发
 
 需要 JDK 21。Gradle 用项目内的 Wrapper。
@@ -141,7 +167,7 @@ scripts/sync-protocol.sh       # 默认从同级目录 ../tianting-server（或 
 
 ## 集成测试
 
-集成测试会编译并启动真实的服务端（测试模式，`IM_V13_ADMIN_FEATURES=1`，推送用例另加 `IM_PUSH_ENABLED=1`），需要 Go 1.27+ 和 tianting-server 的源码：
+集成测试会编译并启动真实的服务端（测试模式，`IM_V13_ADMIN_FEATURES=1`，推送用例另加 `IM_PUSH_ENABLED=1`），需要 Go 1.27+ 和 tianting-server 的源码；文件用例（`FilesIntegrationTest`）另外启动 `sdk-core/src/test/resources/fake_s3.py`（标准库 Python 3，只监听 127.0.0.1，不验签名）：
 
 ```bash
 ./gradlew :sdk-core:integrationTest   # 含 PushIntegrationTest（IM_PUSH_ENABLED=1，另起一个关闭开关的服务端验 4001）。默认找同级目录 ../tianting-server/server 或 ../im-mvp/server

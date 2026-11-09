@@ -75,6 +75,7 @@ fun conv(
     myRole: String? = null,
     allMuted: Boolean = false,
     mutedUntil: Any? = ABSENT,
+    modVer: Long? = null,
 ): JsonObject {
     val m = linkedMapOf<String, Any?>(
         "convId" to convId,
@@ -91,6 +92,7 @@ fun conv(
     myRole?.let { m["myRole"] = it }
     if (allMuted) m["allMuted"] = true
     if (mutedUntil != ABSENT) m["mutedUntil"] = mutedUntil
+    modVer?.let { m["modVer"] = it }
     return js(m).jsonObject
 }
 
@@ -188,7 +190,8 @@ abstract class SdkTest {
         pushCursorStore: PushCursorStore? = null,
         pushLimits: PushLimits = PushLimits(),
         timings: IMClientTimings = IMClientTimings(),
-    ): Harness = Harness(platform, database, clock, random, pushCursorStore, pushLimits, timings).also { harnesses.add(it) }
+        filesRoot: File? = null,
+    ): Harness = Harness(platform, database, clock, random, pushCursorStore, pushLimits, timings, filesRoot).also { harnesses.add(it) }
 
     @AfterEach
     fun framesMatchSchema() {
@@ -205,11 +208,27 @@ class Harness(
     pushCursorStore: PushCursorStore? = null,
     pushLimits: PushLimits = PushLimits(),
     timings: IMClientTimings = IMClientTimings(),
+    /** 附件沙盒和下载缓存的根目录；null 时用新的临时目录。冷启动用例传同一个。 */
+    filesRoot: File? = null,
 ) {
     val scheduler = TestCoroutineScheduler()
     val dispatcher = StandardTestDispatcher(scheduler)
     val callScope = CoroutineScope(dispatcher + SupervisorJob())
     val transport = FakeTransport { flush() }
+
+    /** 文件接口的 Bearer 来源：AccountHarness 设成它的 AccountClient；默认是固定 token。 */
+    var fileAuth: FileAuth? = null
+    val objects = com.tianting.sdk.testing.FakeObjects { flush() }
+    val filesRoot: File = filesRoot ?: java.nio.file.Files.createTempDirectory("tt-files-").toFile()
+    val attachmentDir = File(this.filesRoot, "attachments")
+    val cacheDir = File(this.filesRoot, "cache")
+    val files = FileClient(
+        object : FileAuth {
+            override suspend fun authorized(method: String, path: String, body: JsonElement?): JsonElement =
+                (fileAuth ?: error("fileAuth not set")).authorized(method, path, body)
+        },
+        objects,
+    )
     val logs = ArrayList<String>()
     var visible = true
     val events = ArrayList<IMEvent>()
@@ -235,6 +254,10 @@ class Harness(
             pushCursorStore = pushCursorStore,
             pushLimits = pushLimits,
             timings = timings,
+            files = files,
+            attachmentDir = attachmentDir,
+            fileCacheDir = cacheDir,
+            ioDispatcher = dispatcher,
         ),
     )
 
@@ -301,6 +324,10 @@ class Harness(
             is SendError.Code -> "(${e.code})"
             SendError.Timeout -> "(timeout)"
             SendError.Kicked -> "(kicked)"
+            SendError.Network -> "(network)"
+            SendError.Process -> "(process)"
+            SendError.Storage -> "(storage)"
+            SendError.SourceMissing -> "(sourceMissing)"
         }
         "${m.clientMsgId}:${m.status.name.lowercase()}$err${m.seq?.let { "#$it" } ?: ""}"
     }

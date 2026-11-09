@@ -51,6 +51,15 @@ object HttpSchema {
 
     val endpoints: Set<String> = root["endpoints"].fieldNames().asSequence().toSet()
 
+    /** endpoints 的键（`POST /v1/files/{fileId}/complete`）对应的请求，路径参数按 FileId 的字符集匹配。 */
+    fun endpointKey(method: String, path: String): String? {
+        val ep = "$method $path"
+        if (ep in endpoints) return ep
+        return endpoints.firstOrNull { k ->
+            Regex("^" + Regex.escape(k).replace(Regex("\\{[^}]+\\}"), "\\\\E[A-Za-z0-9_-]{1,64}\\\\Q") + "$").matches(ep)
+        }
+    }
+
     fun requestDef(endpoint: String): String? = root["endpoints"][endpoint]?.get("request")?.asText()
 
     fun errors(body: String, def: String): List<String> {
@@ -150,6 +159,7 @@ class AccountHarness(val h: Harness, val store: MemoryStore = MemoryStore(), val
     val account: AccountClient = newClient()
 
     init {
+        h.fileAuth = account
         http.onRequest = { call -> check(call) }
         h.callScope.launch(start = CoroutineStart.UNDISPATCHED) { h.im.banner.collect { banner.add(it) } }
         h.flush()
@@ -157,7 +167,7 @@ class AccountHarness(val h: Harness, val store: MemoryStore = MemoryStore(), val
 
     fun check(call: FakeHttpCall) {
         peak = maxOf(peak, http.pending.size)
-        val ep = "${call.req.method} ${call.path}"
+        val ep = HttpSchema.endpointKey(call.req.method, call.path) ?: "${call.req.method} ${call.path}"
         if (ep !in HttpSchema.endpoints) {
             badRequests.add("no endpoint $ep")
         } else {

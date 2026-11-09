@@ -1,13 +1,14 @@
 // TC-CHAT-90-09（AC-CHAT-90-10）：账号接口的请求和 http-client.schema.json 一致。
 package com.tianting.sdk
 
+import kotlinx.coroutines.launch
 import org.junit.jupiter.api.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 class AccountHttpSchemaTest : AccountTest() {
     @Test
-    fun `TC-CHAT-90-09 AccountClient 的 14 个接口都在 endpoints 里，请求体符合 Schema`() {
+    fun `TC-CHAT-90-09 AccountClient 的 14 个接口和 FileClient 的 4 个文件接口都在 endpoints 里，请求体符合 Schema`() {
         val a = setupAccount()
         a.session(1, DAY)
         a.start { getConfig() }
@@ -16,6 +17,13 @@ class AccountHttpSchemaTest : AccountTest() {
         a.start { regenerateRecoveryCode("Password-1") }
         a.start { ackRecoveryCode(2) }
         a.start { cancelDelete("alice_1", "Password-1") }
+        // 文件接口（FE-631，F-FILE-01、04）：经过 AccountClient.authorized 带 Bearer。
+        val f = a.h.files
+        a.h.callScope.launch { runCatching { f.createUpload(UploadRequest("image", "a.jpg", 10, "image/jpeg", 5, "image/jpeg")) } }
+        a.h.callScope.launch { runCatching { f.complete("F1") } }
+        a.h.callScope.launch { runCatching { f.cancelUpload("F1") } }
+        a.h.callScope.launch { runCatching { f.urls(listOf(FileUrlItem("F1", FileVariant.THUMB))) } }
+        a.h.flush()
         for (c in a.http.calls.toList()) c.respond(200)
         // 串行队列里的，每个都放行再看下一个。
         val inQueue: List<suspend AccountClient.() -> Unit> = listOf(
@@ -33,7 +41,7 @@ class AccountHttpSchemaTest : AccountTest() {
         val logout = a.start { logout() }
         a.http.pending[0].respond(200)
         a.await(logout)
-        val seen = a.http.calls.map { "${it.req.method} ${it.path}" }.toSet()
+        val seen = a.http.calls.map { HttpSchema.endpointKey(it.req.method, it.path) ?: "${it.req.method} ${it.path}" }.toSet()
         assertEquals(emptyList(), HttpSchema.endpoints.filter { it !in seen && !it.endsWith("/token/refresh") })
         assertEquals(emptyList(), a.badRequests)
     }

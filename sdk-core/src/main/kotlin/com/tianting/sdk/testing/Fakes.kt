@@ -225,3 +225,82 @@ public class FakeTransport(public var afterEach: () -> Unit = {}) : Transport {
     /** 最近一条连接。 */
     public val current: FakeConnection get() = connections.lastOrNull() ?: throw AssertionError("no connection opened")
 }
+
+/** 一次假的对象存储传输（PUT 或 GET）：测试代码决定进度和结果。PUT 的内容在发起时读出来（之后删掉源文件也不影响断言）。 */
+public class FakeObjectCall internal constructor(
+    public val method: String,
+    public val url: String,
+    public val headers: Map<String, String>,
+    public val bytes: ByteArray?,
+    private val dest: java.io.File?,
+    private val progress: (Long) -> Unit,
+    private val callback: com.tianting.sdk.ObjectCallback,
+    private val afterEach: () -> Unit,
+) : HttpCall {
+    public var settled: Boolean = false
+        private set
+    public var cancelled: Boolean = false
+        private set
+
+    public val size: Long get() = bytes?.size?.toLong() ?: 0
+
+    override fun cancel() {
+        cancelled = true
+    }
+
+    /** 报告已传的字节数。 */
+    public fun sent(n: Long) {
+        progress(n)
+        afterEach()
+    }
+
+    /** 结束：默认 200。GET 成功时把 body 写进目标文件（写一半再失败用 failAfter）。 */
+    public fun respond(status: Int = 200, body: ByteArray = ByteArray(0)) {
+        if (settled) return
+        settled = true
+        if (status in 200..299) {
+            if (dest != null) dest.writeBytes(body)
+            progress(if (method == "PUT") size else body.size.toLong())
+        }
+        callback.onDone(status)
+        afterEach()
+    }
+
+    /** GET 写了一部分内容之后断网。 */
+    public fun failAfter(partial: ByteArray) {
+        if (settled) return
+        dest?.writeBytes(partial)
+        progress(partial.size.toLong())
+        fail()
+    }
+
+    public fun fail() {
+        if (settled) return
+        settled = true
+        callback.onFailure()
+        afterEach()
+    }
+}
+
+/** 假的对象存储（PRD-chat 第 4.5 节）：记录每个 PUT、GET。auto 为 true 时 PUT 立即回 200。 */
+public class FakeObjects(public var afterEach: () -> Unit = {}) : com.tianting.sdk.ObjectTransport {
+    public val calls: MutableList<FakeObjectCall> = ArrayList()
+    public var auto: Boolean = false
+
+    override fun put(url: String, headers: Map<String, String>, file: java.io.File, onProgress: (Long) -> Unit, callback: com.tianting.sdk.ObjectCallback): HttpCall {
+        val c = FakeObjectCall("PUT", url, headers, if (file.isFile) file.readBytes() else null, null, onProgress, callback) { afterEach() }
+        calls.add(c)
+        if (c.bytes == null) c.fail() else if (auto) c.respond(200)
+        return c
+    }
+
+    override fun get(url: String, dest: java.io.File, onProgress: (Long) -> Unit, callback: com.tianting.sdk.ObjectCallback): HttpCall {
+        val c = FakeObjectCall("GET", url, emptyMap(), null, dest, onProgress, callback) { afterEach() }
+        calls.add(c)
+        return c
+    }
+
+    public val puts: List<FakeObjectCall> get() = calls.filter { it.method == "PUT" }
+    public val gets: List<FakeObjectCall> get() = calls.filter { it.method == "GET" }
+    public val pending: List<FakeObjectCall> get() = calls.filter { !it.settled && !it.cancelled }
+}

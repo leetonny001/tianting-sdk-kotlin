@@ -6,6 +6,7 @@ import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
@@ -56,6 +57,12 @@ public sealed interface IMEvent {
 
     /** 被踢或收到不应重连的关闭码，连接已停止，需要回到登录页（C-01）。 */
     public data class Fatal(val reason: FatalReason) : IMEvent
+
+    /**
+     * 这些文件已过期或所在消息被删除（F-FILE-06 规则 3、AC-FILE-06-12）：SDK 已经丢掉它们的地址和下载缓存，
+     * App 自己另外缓存过（例如图片库的内存缓存）的也要清掉。
+     */
+    public data class FilesExpired(val fileIds: List<String>) : IMEvent
 
     /** 账号在新设备登录等安全提醒（PRD-chat F-ACC-02 规则 3b）。不认识的 kind 不发。 */
     public data class SecurityNotice(val kind: String, val at: Long, val platform: String?) : IMEvent
@@ -108,7 +115,21 @@ public class IMClientOptions(
     /** 推送游标的持久化，独立于 database（PRD-live 4.9 节）。为 null 时游标只在内存，每个新实例从 afterSeq=0 开始。 */
     public val pushCursorStore: PushCursorStore? = null,
     public val pushLimits: PushLimits = PushLimits(),
+    /** 图片和文件（PRD-chat 第 13.1 节）。为 null 时 sendImage、sendFile、getFileUrls、download 抛 IllegalStateException。 */
+    public val files: FileClient? = null,
+    /**
+     * 附件的沙盒目录（F-FILE-07 规则 2）：发送前 SDK 把 App 给的文件复制到这里，发出后删除，失败的保留供重发，退出登录时清空。
+     * 只给 SDK 用（App 的私有目录下单独一个子目录，例如 filesDir/tianting-attachments）。sendImage、sendFile 需要它。
+     */
+    public val attachmentDir: java.io.File? = null,
+    /** 下载缓存目录（F-FILE-04 规则 5：键是 fileId + variant），过期、被删时清除，退出登录时清空。download 需要它。 */
+    public val fileCacheDir: java.io.File? = null,
+    /** 复制文件用的调度器；默认 Dispatchers.IO，测试时注入 TestDispatcher。 */
+    public val ioDispatcher: CoroutineDispatcher? = null,
 )
+
+/** sendImage、sendFile 的上传进度：已发送字节、总字节（原图 + 缩略图）。可以在任意线程回调。 */
+public typealias UploadProgress = (sent: Long, total: Long) -> Unit
 
 /** 缺口超过这么多条时，只加载最新一页，更早的靠向上翻页（C-24）。 */
 private const val MAX_CATCH_UP = 200L
@@ -125,7 +146,8 @@ private const val USERS_MERGE_MS = 16L
 private val SECURITY_NOTICE_KINDS = setOf(
     "newDeviceLogin", "passwordChanged", "passwordRecovered", "recoveryCodeRegenerated", "refreshReplay", "refreshRateLimited", "newIpPrefix",
 )
-private const val MAX_SAFE_INTEGER = 9007199254740991L // 打开未知会话时的 beforeSeq，与 sdk-ts 相同
+private const val MAX_SAFE_INTEGER = 9007199254740991L
+private const val URL_REUSE_MARGIN_MS = 15_000L // 地址剩余不到这么久就不再复用，重新申请（下载要时间） // 打开未知会话时的 beforeSeq，与 sdk-ts 相同
 
 /**
  * IM 统一 SDK 的入口（docs/sdk/README.md 的 IMClient）。不依赖任何 UI 框架：界面订阅 StateFlow / events、调 suspend 方法。
@@ -181,6 +203,27 @@ public class IMClient(private val o: IMClientOptions) {
     private var closed = false
     private var provider: TokenProvider? = null
     private var unsubscribeProvider: List<() -> Unit> = emptyList()
+    private val io: CoroutineDispatcher = o.ioDispatcher ?: Dispatchers.IO
+    private val files: FileClient? = o.files?.also { f ->
+        f.random = o.random
+        f.log = o.logger
+    }
+    private val sources = HashMap<String, Source>() // clientMsgId → 附件的源（沙盒副本或还没调用的处理函数）
+    private val uploadQueue = ArrayDeque<Pair<String, String>>()
+    private var job: UploadJob? = null
+    private val modVers = HashMap<String, Long>() // 最近一次重拉时各会话的 modVer（F-RCL-03 规则 2）
+    private val urlCache = HashMap<String, Pair<String, Long>>() // fileId + variant → 地址、到期时间（只在内存）
+    private val urlWaiting = HashMap<String, CompletableDeferred<FileUrlResult>>()
+    private val urlQueue = ArrayList<FileUrlItem>()
+    private var urlFlushScheduled = false
+
+    private class Source(var rec: AttachmentRecord, var produce: (suspend () -> ProcessedImage)?, var onProgress: UploadProgress?)
+
+    private class UploadJob(val convId: String, val clientMsgId: String) {
+        var fileId: String? = null
+        var completed = false
+        var coroutine: Job? = null
+    }
 
     private val _state = MutableStateFlow(ConnState.DISCONNECTED)
     private val _banner = MutableStateFlow(false)
@@ -287,6 +330,7 @@ public class IMClient(private val o: IMClientOptions) {
     public val pushSynced: Flow<Long> = _pushSynced.asSharedFlow()
 
     init {
+        files?.clock = clock
         scope.launch { guard { restore() } }
     }
 
@@ -357,6 +401,7 @@ public class IMClient(private val o: IMClientOptions) {
 
     private fun wipeAfterLogout() {
         reset()
+        clearFileState(deleteDirs = true) // 沙盒副本、下载缓存（AC-FILE-07-9）
         local?.let { db -> dbSafe { db.wipeAll() } }
         local?.paused = false
         wipedByFatal = false
@@ -413,15 +458,31 @@ public class IMClient(private val o: IMClientOptions) {
         }
     }
 
-    /** 手动重发失败的消息，沿用原来的 clientMsgId（PRD F-MSG-03 规则 2）。 */
+    /**
+     * 手动重发失败的消息，沿用原来的 clientMsgId（PRD F-MSG-03 规则 2）。
+     * 附件（F-FILE-07 规则 4）：已经 complete 的复用同一 fileId，不重传（AC-FILE-07-2）；没上传完的用沙盒副本从头上传（新的 fileId，
+     * AC-FILE-07-1、07-5）；沙盒副本已经不在的不动，error 改成 SourceMissing（"原文件已不可用，请重新选择"，只能删除）。
+     */
     public suspend fun retry(convId: String, clientMsgId: String): Unit = onSdk {
         val m = store.listIfExists(convId)?.local(clientMsgId)
         if (m == null || m.status != MessageStatus.FAILED) return@onSdk
+        if (needsUpload(m)) {
+            if (!hasSource(clientMsgId) || (sources[clientMsgId]?.rec?.copied == true && !withContext(io) { java.io.File(sandboxOf(clientMsgId), "original").isFile })) {
+                store.list(convId).update(clientMsgId) { it.copy(error = SendError.SourceMissing, errorReason = null) }
+                emitMessages(convId)
+                return@onSdk
+            }
+            val st = if (sources[clientMsgId]?.rec?.copied == true) MessageStatus.UPLOADING else MessageStatus.PROCESSING
+            store.list(convId).update(clientMsgId) { it.copy(status = st, error = null, errorReason = null) }
+            emitMessages(convId)
+            enqueueUpload(convId, clientMsgId)
+            return@onSdk
+        }
         if (conn.state == ConnState.CONNECTED) {
             dispatch(convId, clientMsgId)
         } else {
             autoUsed.add(clientMsgId) // 手动重发也只自动补发一次
-            store.list(convId).update(clientMsgId) { it.copy(status = MessageStatus.QUEUED, error = null) }
+            store.list(convId).update(clientMsgId) { it.copy(status = MessageStatus.QUEUED, error = null, errorReason = null) }
             emitMessages(convId)
         }
     }
@@ -434,8 +495,437 @@ public class IMClient(private val o: IMClientOptions) {
         val list = store.listIfExists(convId) ?: return@onSdk false
         var removed = false
         store.transaction { removed = list.removeFailed(clientMsgId) }
+        if (removed) dropSource(clientMsgId)
         if (removed) emitMessages(convId)
         removed
+    }
+
+    // ---- 图片和文件（FE-631，PRD-chat F-FILE-01～07） ----
+
+    /**
+     * 发图片（第 13.1 节，F-FILE-02、07）：图片已经处理好写成文件。SDK 先把原图和缩略图复制进沙盒（attachmentDir，规则 2），
+     * 插入一条"上传中"的消息并返回；然后按全局并发 1、选择顺序（规则 5、6）申请 → PUT 原图、缩略图 → complete，再按文本的规则 send。
+     * 文字可以越过上传中的图片；上传中不算 10 秒发送超时（规则 8）。复制失败：失败，error=Storage。
+     * 4292、4290（uploadPendingLimit）不自动重试（F-FILE-01 规则 6、6a）；complete 的 5032 退避重试 3 次。
+     */
+    public suspend fun sendImage(convId: String, processed: ProcessedImage, onProgress: UploadProgress? = null): Message = onSdk {
+        val body = MsgBody(image = ImageBody("", processed.width, processed.height, processed.original.file.length(), processed.original.mime))
+        val m = addAttachment(convId, MsgType.IMAGE, body, MessageStatus.UPLOADING, imageRecord(convId, "", processed, false), null, onProgress)
+        if (copyIn(m.clientMsgId, processed.original.file, processed.thumb.file)) enqueueUpload(convId, m.clientMsgId)
+        store.listIfExists(convId)?.local(m.clientMsgId) ?: m
+    }
+
+    /**
+     * 发图片，图片还要处理：先插入一条"处理中"的消息并返回，轮到它时（并发 1）才调用 produce（在 SDK 线程上调用，
+     * 解码、压缩要自己切到后台调度器），拿到结果后复制进沙盒再上传。produce 抛异常：失败，error=Process
+     * （"无法处理这张图片，请用文件方式发送"）。width、height 是占位用的尺寸（可以为 null）。
+     */
+    public suspend fun sendImage(
+        convId: String,
+        width: Int?,
+        height: Int?,
+        produce: suspend () -> ProcessedImage,
+        onProgress: UploadProgress? = null,
+    ): Message = onSdk {
+        val body = MsgBody(image = ImageBody("", width, height))
+        val rec = AttachmentRecord(convId, "", "image", "image", "image/jpeg")
+        val m = addAttachment(convId, MsgType.IMAGE, body, MessageStatus.PROCESSING, rec, produce, onProgress)
+        enqueueUpload(convId, m.clientMsgId)
+        m
+    }
+
+    /** 发文件（F-FILE-03、07）：内容不重新编码。其余同 sendImage。 */
+    public suspend fun sendFile(convId: String, file: FileInput, onProgress: UploadProgress? = null): Message = onSdk {
+        val body = MsgBody(file = FileBody("", file.name, file.file.length(), file.mime))
+        val rec = AttachmentRecord(convId, "", "file", file.name, file.mime)
+        val m = addAttachment(convId, MsgType.FILE, body, MessageStatus.UPLOADING, rec, null, onProgress)
+        if (copyIn(m.clientMsgId, file.file, null)) enqueueUpload(convId, m.clientMsgId)
+        store.listIfExists(convId)?.local(m.clientMsgId) ?: m
+    }
+
+    /**
+     * 取消一条还没发出的附件（AC-FILE-02-5、AC-FILE-01-17）：中止上传，已经申请过的发 DELETE /v1/files/uploads/{id}，
+     * 消息从列表消失，不发 send，沙盒副本删除。已经在 send 的不能取消，返回 false。失败的附件也可以用它删除。
+     */
+    public suspend fun cancelUpload(convId: String, clientMsgId: String): Boolean = onSdk {
+        val list = store.listIfExists(convId) ?: return@onSdk false
+        val m = list.local(clientMsgId) ?: return@onSdk false
+        if (m.type != MsgType.IMAGE && m.type != MsgType.FILE) return@onSdk false
+        var removed = false
+        val statuses = setOf(MessageStatus.PROCESSING, MessageStatus.UPLOADING, MessageStatus.QUEUED, MessageStatus.FAILED)
+        store.transaction { removed = list.removeUnsent(clientMsgId, statuses) }
+        if (!removed) return@onSdk false
+        val j = job
+        val fileId = if (j != null && j.clientMsgId == clientMsgId) {
+            j.coroutine?.cancel()
+            job = null
+            j.fileId
+        } else {
+            m.body.fileId?.takeIf { it.isNotEmpty() }
+        }
+        if (fileId != null) launchNow { files?.cancelUpload(fileId) }
+        uploadQueue.removeAll { it.second == clientMsgId }
+        dropSource(clientMsgId)
+        emitMessages(convId)
+        pumpUploads()
+        true
+    }
+
+    /**
+     * 取下载地址（F-FILE-04）。SDK 线程上同一轮的调用合并成一批（每批 ≤ 50，规则 6），没过期的地址用内存缓存（AC-FILE-04-10）。
+     * 已知过期的文件不发请求，直接 code=4048（AC-FILE-06-6）。地址不要持久化、打日志（规则 5）。整批失败时抛出。
+     */
+    public suspend fun getFileUrls(items: List<FileUrlItem>): List<FileUrlResult> = onSdk {
+        requireFiles()
+        val waits = items.map { item ->
+            if (store.fileExpired(item.fileId)) return@map CompletableDeferred(FileUrlResult(item.fileId, item.variant, code = 4048))
+            val key = urlKey(item)
+            val hit = urlCache[key]
+            if (hit != null && hit.second - clock.now() > URL_REUSE_MARGIN_MS) {
+                return@map CompletableDeferred(FileUrlResult(item.fileId, item.variant, hit.first, hit.second))
+            }
+            urlWaiting.getOrPut(key) {
+                urlQueue.add(item)
+                if (!urlFlushScheduled) {
+                    urlFlushScheduled = true
+                    scope.launch { guard { flushUrls() } }
+                }
+                CompletableDeferred()
+            }
+        }
+        waits.map { it.await() }
+    }
+
+    /**
+     * 下载一个文件或缩略图到缓存（第 13.2 节：App 内 OkHttp 到私有缓存，键 fileId + variant，F-FILE-04 规则 5）。
+     * 已经缓存的直接返回（AC-FILE-04-10）。地址过期（对象存储 403）重新申请一次（F-FILE-03 异常）。
+     * 失败时删掉下了一半的文件、丢掉地址，再调一次就从 0 开始、重新申请地址（AC-FILE-03-5）；取消调用方的协程即中止下载。
+     * 不可访问、已过期：IMError(4048)；对象存储或网络失败：ObjectTransferError / AccountNetworkError。onProgress 可以在任意线程回调。
+     */
+    public suspend fun download(fileId: String, variant: FileVariant, onProgress: ((Long) -> Unit)? = null): java.io.File = onSdk {
+        val f = requireFiles()
+        val dir = o.fileCacheDir ?: throw IllegalStateException("fileCacheDir not configured")
+        val dest = cacheFile(dir, fileId, variant)
+        if (dest.isFile) return@onSdk dest
+        if (store.fileExpired(fileId)) throw IMError(4048, "file unavailable")
+        val item = FileUrlItem(fileId, variant)
+        var attempt = 0
+        while (true) {
+            val r = getFileUrls(listOf(item)).first()
+            val url = r.url ?: throw IMError(r.code ?: 4048, "file unavailable")
+            withContext(io) { dir.mkdirs() }
+            val tmp = java.io.File(dir, dest.name + ".part" + o.newId().filter { it.isLetterOrDigit() }.take(12))
+            try {
+                f.get(url, tmp) { onProgress?.invoke(it) }
+                if (store.fileExpired(fileId)) throw IMError(4048, "file unavailable")
+                withContext(io) { check(tmp.renameTo(dest) || (tmp.copyTo(dest, true).exists() && tmp.delete())) }
+                return@onSdk dest
+            } catch (e: Throwable) {
+                withContext(kotlinx.coroutines.NonCancellable + io) { tmp.delete() }
+                urlCache.remove(urlKey(item)) // 再试一次时重新申请地址
+                if (e is ObjectTransferError && e.status == 403 && attempt == 0) {
+                    attempt++
+                    continue
+                }
+                throw e
+            }
+        }
+        @Suppress("UNREACHABLE_CODE")
+        dest
+    }
+
+    /** 已经缓存的文件（没有时为 null）。 */
+    public suspend fun cachedFile(fileId: String, variant: FileVariant): java.io.File? = onSdk {
+        o.fileCacheDir?.let { cacheFile(it, fileId, variant) }?.takeIf { withContext(io) { it.isFile } }
+    }
+
+    private fun requireFiles(): FileClient = files ?: throw IllegalStateException("files not configured: pass IMClientOptions.files")
+
+    private fun urlKey(i: FileUrlItem) = "${i.fileId}\u0000${i.variant.wire}"
+
+    private suspend fun flushUrls() {
+        urlFlushScheduled = false
+        val all = ArrayList(urlQueue)
+        urlQueue.clear()
+        for (batch in all.chunked(URLS_BATCH)) {
+            launchNow {
+                try {
+                    val res = requireFiles().urls(batch)
+                    for (r in res) {
+                        val key = urlKey(FileUrlItem(r.fileId, r.variant))
+                        if (r.url != null && r.expiresAt != null) urlCache[key] = r.url to r.expiresAt
+                        urlWaiting.remove(key)?.complete(r)
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    log.warn("files: urls failed: ${if (e is IMError) e.code else "network"}")
+                    for (i in batch) urlWaiting.remove(urlKey(i))?.completeExceptionally(e)
+                }
+            }
+        }
+    }
+
+    private fun addAttachment(
+        convId: String,
+        type: MsgType,
+        body: MsgBody,
+        status: MessageStatus,
+        rec: AttachmentRecord,
+        produce: (suspend () -> ProcessedImage)?,
+        onProgress: UploadProgress?,
+    ): Message {
+        requireFiles()
+        if (o.attachmentDir == null) throw IllegalStateException("attachmentDir not configured")
+        if (self.isEmpty()) throw NotConnectedError()
+        parseConvIdStrict(convId, self)
+        val msg = Message(clientMsgId = o.newId(), convId = convId, from = self, type = type, body = body, ts = clock.now(), status = status)
+        val r = rec.copy(clientMsgId = msg.clientMsgId)
+        store.transaction {
+            store.list(convId).addLocal(msg)
+            local?.saveAttachment(r)
+        }
+        sources[msg.clientMsgId] = Source(r, produce, onProgress)
+        emitMessages(convId)
+        return msg
+    }
+
+    private fun imageRecord(convId: String, clientMsgId: String, p: ProcessedImage, copied: Boolean) = AttachmentRecord(
+        convId, clientMsgId, "image", p.name ?: "image", p.original.mime, p.thumb.mime, p.width, p.height, copied,
+    )
+
+    /** 沙盒目录：按 clientMsgId 的摘要命名（clientMsgId 可以是任何字符串，不能直接当路径）。 */
+    private fun sandboxOf(clientMsgId: String): java.io.File {
+        val h = java.security.MessageDigest.getInstance("SHA-256").digest(clientMsgId.toByteArray()).joinToString("") { "%02x".format(it) }
+        return java.io.File(o.attachmentDir!!, "a-" + h.take(32))
+    }
+
+    /** 复制进沙盒（规则 2）。失败：消息失败，error=Storage（"存储空间不足"）。返回是否成功。 */
+    private suspend fun copyIn(clientMsgId: String, original: java.io.File, thumb: java.io.File?): Boolean {
+        val dir = sandboxOf(clientMsgId)
+        val ok = try {
+            withContext(io) {
+                dir.mkdirs()
+                original.copyTo(java.io.File(dir, "original"), overwrite = true)
+                thumb?.copyTo(java.io.File(dir, "thumb"), overwrite = true)
+            }
+            true
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log.warn("files: copy to sandbox failed: ${safeDescribe(e)}")
+            withContext(io) { dir.deleteRecursively() }
+            false
+        }
+        val src = sources[clientMsgId]
+        val m = src?.rec?.convId?.let { store.listIfExists(it)?.local(clientMsgId) }
+        if (src == null || m == null) {
+            withContext(io) { dir.deleteRecursively() } // 复制期间被取消了
+            return false
+        }
+        if (!ok) {
+            failAttachment(m.convId, clientMsgId, SendError.Storage)
+            return false
+        }
+        src.rec = src.rec.copy(copied = true)
+        local?.saveAttachment(src.rec)
+        return true
+    }
+
+    private fun dropSource(clientMsgId: String) {
+        val had = sources.remove(clientMsgId)
+        local?.deleteAttachment(clientMsgId)
+        if (o.attachmentDir != null) {
+            val dir = sandboxOf(clientMsgId)
+            scope.launch(io) { dir.deleteRecursively() }
+        }
+        had?.onProgress = null
+    }
+
+    private fun enqueueUpload(convId: String, clientMsgId: String) {
+        uploadQueue.addLast(convId to clientMsgId)
+        pumpUploads()
+    }
+
+    /** 全局一个上传（F-FILE-07 规则 6），按入队顺序（规则 5）。 */
+    private fun pumpUploads() {
+        if (job != null) return
+        val next = uploadQueue.removeFirstOrNull() ?: return
+        val j = UploadJob(next.first, next.second)
+        job = j
+        j.coroutine = launchNow {
+            try {
+                runUpload(j)
+            } finally {
+                if (job === j) {
+                    job = null
+                    pumpUploads()
+                }
+            }
+        }
+    }
+
+    private suspend fun runUpload(j: UploadJob) {
+        val f = requireFiles()
+        val convId = j.convId
+        val id = j.clientMsgId
+        fun alive() = job === j && store.listIfExists(convId)?.local(id) != null
+        val src = sources[id] ?: return
+        if (!alive()) return
+        if (!src.rec.copied) {
+            val produce = src.produce
+            if (produce == null) {
+                failAttachment(convId, id, SendError.SourceMissing)
+                return
+            }
+            val img = try {
+                produce()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (alive()) failAttachment(convId, id, SendError.Process)
+                return
+            }
+            if (!alive()) return
+            src.rec = imageRecord(convId, id, img, false)
+            src.produce = null
+            store.list(convId).update(id) {
+                it.copy(
+                    status = MessageStatus.UPLOADING,
+                    body = MsgBody(image = ImageBody("", img.width, img.height, img.original.file.length(), img.original.mime)),
+                )
+            }
+            emitMessages(convId)
+            if (!copyIn(id, img.original.file, img.thumb.file) || !alive()) return
+        } else {
+            store.list(convId).update(id) { it.copy(status = MessageStatus.UPLOADING) }
+            emitMessages(convId)
+        }
+        val rec = src.rec
+        val dir = sandboxOf(id)
+        val main = java.io.File(dir, "original")
+        val thumb = if (rec.kind == "image") java.io.File(dir, "thumb") else null
+        val (mainSize, thumbSize) = withContext(io) { main.length() to (thumb?.length() ?: 0L) }
+        if (withContext(io) { !main.isFile || (thumb != null && !thumb.isFile) }) {
+            failAttachment(convId, id, SendError.SourceMissing)
+            return
+        }
+        val total = mainSize + thumbSize
+        try {
+            val up = f.createUpload(
+                UploadRequest(rec.kind, rec.name, mainSize, rec.mime, if (thumb != null) thumbSize else null, if (thumb != null) rec.thumbMime ?: rec.mime else null),
+            )
+            j.fileId = up.fileId
+            if (!alive()) return
+            f.put(up.put, main) { n -> src.onProgress?.invoke(n, total) }
+            if (thumb != null) {
+                val tp = up.thumbPut ?: throw ObjectTransferError(0)
+                if (!alive()) return
+                f.put(tp, thumb) { n -> src.onProgress?.invoke(mainSize + n, total) }
+            }
+            if (!alive()) return
+            val done = f.complete(up.fileId)
+            j.completed = true
+            if (!alive()) return
+            store.list(convId).update(id) { m ->
+                val body = if (rec.kind == "image") {
+                    MsgBody(
+                        image = (m.body.image ?: ImageBody("")).copy(
+                            fileId = done.fileId, size = done.size, mime = done.mime,
+                            width = done.width ?: m.body.image?.width, height = done.height ?: m.body.image?.height,
+                        ),
+                    )
+                } else {
+                    MsgBody(file = (m.body.file ?: FileBody("")).copy(fileId = done.fileId, size = done.size, mime = done.mime))
+                }
+                // 待发送（规则 1）：在线就发，否则排队，连上后按现有规则自动发一次（规则 3）。
+                m.copy(body = body, status = if (conn.state == ConnState.CONNECTED) m.status else MessageStatus.QUEUED)
+            }
+            if (conn.state == ConnState.CONNECTED) dispatch(convId, id) else emitMessages(convId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (!alive()) return
+            // 没完成的上传尽力取消，立刻释放未完成名额（F-FILE-01 规则 6a）。
+            val fid = j.fileId
+            if (fid != null && !j.completed) launchNow { f.cancelUpload(fid) }
+            when (e) {
+                is IMError -> failAttachment(convId, id, SendError.Code(e.code), (e as? AccountError)?.reason)
+                else -> failAttachment(convId, id, SendError.Network)
+            }
+        }
+    }
+
+    private fun failAttachment(convId: String, clientMsgId: String, error: SendError, reason: String? = null) {
+        val list = store.listIfExists(convId) ?: return
+        val m = list.local(clientMsgId) ?: return
+        if (m.seq != null || m.status == MessageStatus.FAILED) return
+        list.update(clientMsgId) { it.copy(status = MessageStatus.FAILED, error = error, errorReason = reason) }
+        emitMessages(convId)
+        emit(IMEvent.SendFailed(convId, clientMsgId, error))
+    }
+
+    /** 附件消息还没有 fileId（没上传完）。 */
+    private fun needsUpload(m: Message): Boolean =
+        (m.type == MsgType.IMAGE || m.type == MsgType.FILE) && m.body.fileId.isNullOrEmpty()
+
+    /** 源还在：沙盒副本已复制，或者处理函数还在内存里。 */
+    private fun hasSource(clientMsgId: String): Boolean {
+        val s = sources[clientMsgId] ?: return false
+        return s.produce != null || s.rec.copied
+    }
+
+    /**
+     * send 返回 4096（文件超过 24 小时被清理）：有沙盒副本的回到上传中、从头上传，不算自动重发次数（RC2-23）；
+     * 没有的转失败，error=SourceMissing（F-FILE-07 规则 4，AC-FILE-07-10）。
+     */
+    private fun reupload(convId: String, clientMsgId: String) {
+        val list = store.list(convId)
+        val clear: (Message) -> Message = { m ->
+            m.copy(body = if (m.body.image != null) MsgBody(image = m.body.image.copy(fileId = "")) else MsgBody(file = m.body.file?.copy(fileId = "")))
+        }
+        if (!hasSource(clientMsgId)) {
+            list.update(clientMsgId, clear)
+            fail(convId, clientMsgId, SendError.SourceMissing)
+            return
+        }
+        list.update(clientMsgId) { clear(it).copy(status = MessageStatus.UPLOADING, error = null, errorReason = null) }
+        emitMessages(convId)
+        enqueueUpload(convId, clientMsgId)
+    }
+
+    private fun cacheFile(dir: java.io.File, fileId: String, variant: FileVariant): java.io.File {
+        val h = java.security.MessageDigest.getInstance("SHA-256").digest(fileId.toByteArray()).joinToString("") { "%02x".format(it) }
+        return java.io.File(dir, "f-${h.take(40)}-${variant.wire}")
+    }
+
+    /** 过期或被删的文件：丢掉地址和下载缓存，通知 App（AC-FILE-06-12）。 */
+    private fun forgetFiles(ids: List<String>) {
+        if (ids.isEmpty()) return
+        for (id in ids) for (v in FileVariant.entries) urlCache.remove(urlKey(FileUrlItem(id, v)))
+        o.fileCacheDir?.let { dir ->
+            val targets = ids.flatMap { id -> FileVariant.entries.map { cacheFile(dir, id, it) } }
+            scope.launch(io) { targets.forEach { it.delete() } }
+        }
+        emit(IMEvent.FilesExpired(ids))
+    }
+
+    /** 退出登录：沙盒副本和下载缓存全部删除（AC-FILE-07-9），上传中止。 */
+    private fun clearFileState(deleteDirs: Boolean) {
+        uploadQueue.clear()
+        job?.coroutine?.cancel()
+        job?.let { j -> j.fileId?.takeIf { !j.completed }?.let { fid -> files?.let { f -> scope.launch { f.cancelUpload(fid) } } } }
+        job = null
+        sources.clear()
+        urlCache.clear()
+        urlWaiting.values.forEach { it.completeExceptionally(SessionEndedError()) }
+        urlWaiting.clear()
+        urlQueue.clear()
+        modVers.clear()
+        if (deleteDirs) {
+            val dirs = listOfNotNull(o.attachmentDir, o.fileCacheDir)
+            scope.launch(io) { dirs.forEach { d -> d.listFiles()?.forEach { it.deleteRecursively() } } }
+        }
     }
 
     /** 这个会话当前的禁言：没有被禁言时为 null。按服务端时间判断到期；用户级优先，群内禁言只影响该群；全群禁言不限制群主、管理员。 */
@@ -902,9 +1392,22 @@ public class IMClient(private val o: IMClientOptions) {
             val unsentToFail = ArrayList<Message>()
             for (m in r.messages) {
                 val pending = m.seq == null && (m.status == MessageStatus.QUEUED || m.status == MessageStatus.SENDING)
-                val fixed = if (pending) m.copy(status = MessageStatus.FAILED, error = SendError.Timeout) else m
-                if (pending) unsentToFail.add(fixed)
+                // 处理中、上传中被进程结束打断（F-FILE-07 规则 3）：一律失败，不自动上传，点重发用沙盒副本从头传。
+                val interrupted = m.seq == null && (m.status == MessageStatus.PROCESSING || m.status == MessageStatus.UPLOADING)
+                val fixed = when {
+                    pending -> m.copy(status = MessageStatus.FAILED, error = SendError.Timeout)
+                    interrupted -> m.copy(status = MessageStatus.FAILED, error = SendError.Network)
+                    else -> m
+                }
+                if (pending || interrupted) unsentToFail.add(fixed)
                 store.restoreMessage(fixed)
+            }
+            for (a in r.attachments) sources[a.clientMsgId] = Source(a, null, null)
+            modVers.putAll(r.modVers)
+            o.attachmentDir?.let { dir ->
+                // 上次没删掉的沙盒副本（发出后删除失败、记录已经没有了）：这次启动再删（F-RCL-03 规则 9 同理）。
+                val keep = r.attachments.map { sandboxOf(it.clientMsgId).name }.toSet()
+                scope.launch(io) { dir.listFiles()?.filter { it.name !in keep }?.forEach { it.deleteRecursively() } }
             }
             db.transaction { unsentToFail.forEach { db.upsertMessage(it) } }
             social.restore(r.socialVer, r.requestSeenVer, r.settings, r.official, r.socialLoaded, r.friends, r.requests, r.blocks)
@@ -946,6 +1449,7 @@ public class IMClient(private val o: IMClientOptions) {
         if (self.isNotEmpty() && self != a.userId) {
             // 换了账号：上一个账号的数据不能留。
             reset()
+            clearFileState(deleteDirs = true)
             local?.let { db -> dbSafe { db.wipeAll() } }
         }
         self = a.userId
@@ -967,8 +1471,10 @@ public class IMClient(private val o: IMClientOptions) {
         mutesChanged()
         emitSocial()
         flushQueued()
+        var convs: List<ServerConversation>? = null
         try {
             val ack = req("convs", JsonObject(emptyMap()), ConvsAck.serializer())
+            convs = ack.convs
             applyConvs(ack)
             for (c in ack.convs) catchUp(c)
             maybeReportRead()
@@ -979,26 +1485,37 @@ public class IMClient(private val o: IMClientOptions) {
         // 先 convs，再从本地 socialVer 开始一轮关系同步（F-SOC-06 规则 10）。
         social.needSync = true
         syncSocial()
-        launchNow { recheckDeleted() }
+        val list = convs
+        launchNow { recheckDeleted(list) }
     }
 
     /**
-     * 重连后重新拉一遍已加载的范围：断开期间被删除的消息不会再发 msgDeleted，只有 sync 才能拿到（F-ADM-31 规则 5），
-     * 不拉的话内存和本地库里的原文会一直留着。首次连接没有已加载的消息，不发请求。
+     * 重连后重拉已加载的范围（F-RCL-03 规则 2）：只重拉 modVer 变了的会话（文件过期等），没变的不拉。
+     * 服务端没有 modVer（老服务端）或这次没拿到会话列表时，按原来的做法全部重拉：断开期间被删除的消息
+     * 不会再发 msgDeleted，只有 sync 才能拿到（F-ADM-31 规则 5）。基线存在本地库里，冷启动后同样适用。
      */
-    private suspend fun recheckDeleted() {
+    private suspend fun recheckDeleted(convs: List<ServerConversation>?) {
+        val byId = convs?.associateBy { it.convId } ?: emptyMap()
         for (r in store.loadedRanges()) {
+            val ver = byId[r.convId]?.modVer
+            if (convs != null && r.convId in byId && ver != null && modVers[r.convId] == ver) continue
             try {
                 if (syncAfter(r.convId, r.from - 1, r.to)) {
                     emitMessages(r.convId)
                     emitConversations()
                 }
+                if (ver != null) setModVer(r.convId, ver)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 log.warn("im: recheck deleted failed: ${safeDescribe(e)}")
                 return
             }
         }
+    }
+
+    private fun setModVer(convId: String, ver: Long) {
+        modVers[convId] = ver
+        local?.setModVer(convId, ver)
     }
 
     /**
@@ -1261,6 +1778,8 @@ public class IMClient(private val o: IMClientOptions) {
         store.transaction {
             gone = store.setConversations(ack.convs, ack.truncated)
             for (c in ack.convs) {
+                // 还没加载过消息的会话：之后加载到的就是这个版本以后的内容，记下作为基线。已加载的等重拉成功再更新。
+                if (c.modVer != null && !store.isLoaded(c.convId) && modVers[c.convId] != c.modVer) setModVer(c.convId, c.modVer)
                 // 错过了 msgDeleted 的话，摘要是唯一的线索：本地已加载的那条也要清掉。
                 if (c.lastMsg?.deleted == true && store.deleteMessages(c.convId, listOf(c.lastMsg.msgId), emptyList())) {
                     emitMessages(c.convId)
@@ -1304,6 +1823,8 @@ public class IMClient(private val o: IMClientOptions) {
         bindProvider(null)
         clearSocial()
         for (c in allConvIds()) failPending(c)
+        // 被踢清库：沙盒副本和下载缓存一起删除，失败的附件之后重发提示"原文件已不可用"。
+        clearFileState(deleteDirs = true)
         local?.let { db ->
             dbSafe { db.wipeAll() }
             db.paused = true
@@ -1316,6 +1837,15 @@ public class IMClient(private val o: IMClientOptions) {
     private fun failPending(convId: String) {
         val list = store.listIfExists(convId) ?: return
         val pending = list.pendingMessages()
+        for (m in pending) {
+            uploadQueue.removeAll { it.second == m.clientMsgId }
+            val j = job
+            if (j != null && j.clientMsgId == m.clientMsgId) {
+                j.coroutine?.cancel()
+                job = null
+                j.fileId?.takeIf { !j.completed }?.let { fid -> files?.let { f -> scope.launch { f.cancelUpload(fid) } } }
+            }
+        }
         for (m in pending) list.update(m.clientMsgId) { it.copy(status = MessageStatus.FAILED, error = SendError.Kicked) }
         if (pending.isNotEmpty()) emitMessages(convId)
         for (m in pending) emit(IMEvent.SendFailed(convId, m.clientMsgId, SendError.Kicked))
@@ -1326,12 +1856,13 @@ public class IMClient(private val o: IMClientOptions) {
     private fun dispatch(convId: String, clientMsgId: String) {
         val list = store.list(convId)
         var m: Message? = null
-        m = list.update(clientMsgId) { it.copy(status = MessageStatus.SENDING, error = null) }
+        m = list.update(clientMsgId) { it.copy(status = MessageStatus.SENDING, error = null, errorReason = null) }
         val msg = m ?: return
         emitMessages(convId)
         val parsed = parseConvId(convId, self)
         val type = msg.type
         val onAck: (SendAck) -> Unit = { ack ->
+            if (sources.containsKey(clientMsgId)) dropSource(clientMsgId) // 已发送：删除沙盒副本（F-FILE-07 规则 2）
             // 正文在 ack 到的时候再取：等待期间消息可能已经被删除，回调不能留着一份原文。
             store.transaction {
                 store.applyServerMessage(
@@ -1347,7 +1878,13 @@ public class IMClient(private val o: IMClientOptions) {
             put("to", parsed.to)
             put("clientMsgId", clientMsgId)
             put("type", msg.type.wire)
-            put("body", ImJson.encodeToJsonElement(MsgBody.serializer(), msg.body))
+            // 附件只发 fileId，其他字段由服务端按记录填写（F-FILE-02 规则 1）。
+            val wire = when (type) {
+                MsgType.IMAGE -> MsgBody(image = ImageBody(msg.body.image?.fileId ?: ""))
+                MsgType.FILE -> MsgBody(file = FileBody(msg.body.file?.fileId ?: ""))
+                else -> msg.body
+            }
+            put("body", ImJson.encodeToJsonElement(MsgBody.serializer(), wire))
         }
         launchNow {
             try {
@@ -1371,6 +1908,10 @@ public class IMClient(private val o: IMClientOptions) {
                 // 失败回调是异步的：这期间消息可能已经被别的路径改过状态（例如被踢时标记为失败），只处理仍在发送中的。
                 if (e is IMError && e.code == ErrorCode.MUTED) onMutedAck(e.details)
                 if (list.local(clientMsgId)?.status != MessageStatus.SENDING) return@launchNow
+                if (e is IMError && e.code == ErrorCode.FILE_NOT_READY && (type == MsgType.IMAGE || type == MsgType.FILE)) {
+                    reupload(convId, clientMsgId)
+                    return@launchNow
+                }
                 when {
                     e is IMError -> fail(convId, clientMsgId, SendError.Code(e.code))
                     e is TimeoutError -> fail(convId, clientMsgId, SendError.Timeout)
@@ -1475,6 +2016,7 @@ public class IMClient(private val o: IMClientOptions) {
         emitMessagesQuiet(convId)
         emit(IMEvent.MessagesChanged(convId, store.messages(convId)))
         emitPendingCount()
+        forgetFiles(store.takeExpiredFiles())
     }
 
     private fun emitPendingCount() {
@@ -1495,6 +2037,7 @@ public class IMClient(private val o: IMClientOptions) {
         clearSocial()
         knownLists.clear()
         autoUsed.clear()
+        clearFileState(deleteDirs = false)
         active = null
         lastRead = Long.MIN_VALUE / 2
         synchronized(messageLock) {

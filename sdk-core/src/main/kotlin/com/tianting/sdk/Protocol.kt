@@ -52,7 +52,7 @@ internal object GroupRoleSerializer : WireEnumSerializer<GroupRole>("GroupRole",
 
 @Serializable(with = MsgTypeSerializer::class)
 public enum class MsgType(override val wire: String) : WireEnum {
-    TEXT("text"), CUSTOM("custom"), TIP("tip"), UNKNOWN("unknown"),
+    TEXT("text"), CUSTOM("custom"), TIP("tip"), IMAGE("image"), FILE("file"), UNKNOWN("unknown"),
 }
 
 internal object MsgTypeSerializer : WireEnumSerializer<MsgType>("MsgType", MsgType.entries.toTypedArray(), MsgType.UNKNOWN)
@@ -67,12 +67,44 @@ public data class TipBody(
     val text: String = "",
 )
 
+/**
+ * 图片消息（PRD-chat F-FILE-02）。下行的 size、mime、宽高是服务端记录的真实值；expired=true 时对象已删除，不再发放地址。
+ * 本地还没上传完的消息 fileId 是空字符串。
+ */
+@Serializable
+public data class ImageBody(
+    val fileId: String,
+    val width: Int? = null,
+    val height: Int? = null,
+    val size: Long? = null,
+    val mime: String? = null,
+    val expired: Boolean = false,
+)
+
+/** 文件消息（F-FILE-03）。name 是清洗后的文件名，过期后为空字符串（F-FILE-06 规则 3）。文件名不进日志。 */
+@Serializable
+public data class FileBody(
+    val fileId: String,
+    val name: String? = null,
+    val size: Long? = null,
+    val mime: String? = null,
+    val expired: Boolean = false,
+)
+
 @Serializable
 public data class MsgBody(
     val text: String? = null,
     val data: JsonElement? = null,
     val tip: TipBody? = null,
-)
+    val image: ImageBody? = null,
+    val file: FileBody? = null,
+) {
+    /** 图片或文件的 fileId；不是附件时为 null。 */
+    val fileId: String? get() = image?.fileId ?: file?.fileId
+
+    /** 图片或文件已过期（F-FILE-06 规则 3）。 */
+    val fileExpired: Boolean get() = image?.expired == true || file?.expired == true
+}
 
 /** 服务端的一条消息（msg 帧、sync 结果）。被删除的消息没有 body（PRD-core F-MSG-05 规则 7）。 */
 @Serializable
@@ -144,6 +176,8 @@ internal data class ServerConversation(
     val mutedUntil: Deadline = Deadline.Absent,
     /** 该群开启了全群禁言时才有（P1，F-ADM-42）；群主、管理员也带，但不受限。 */
     val allMuted: Boolean = false,
+    /** 已有消息展示内容的版本号（C2：文件过期），变化时重拉这个会话（F-RCL-03 规则 2）。老服务端没有。 */
+    val modVer: Long? = null,
 )
 
 @Serializable

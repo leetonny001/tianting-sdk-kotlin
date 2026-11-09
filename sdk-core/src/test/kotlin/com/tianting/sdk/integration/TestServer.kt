@@ -25,8 +25,42 @@ private const val CALLER_SECRET = "sdk-it-caller-secret-0123456789abcdef"
 /** 打开第二批功能（IM_V13_ADMIN_FEATURES）需要的环境变量。 */
 val MODERATION_ENV = mapOf("IM_V13_ADMIN_FEATURES" to "1", "IM_QUARANTINE_KEY" to "sdk-it-quarantine-key-0123456789abcdef")
 
+/** 假 S3（test/resources/fake_s3.py，标准库 Python，只监听 127.0.0.1，不验签名，只验调度逻辑）。 */
+class FakeS3 private constructor(private val proc: Process, val endpoint: String) {
+    /** 打开文件功能（IM_FILES_ENABLED）需要的环境变量。凭证是测试用的假值。 */
+    val env: Map<String, String> = mapOf(
+        "IM_FILES_ENABLED" to "1",
+        "IM_OBJSTORE_ENDPOINT" to endpoint,
+        "IM_OBJSTORE_REGION" to "us-east-1",
+        "IM_OBJSTORE_BUCKET" to "chat",
+        "IM_OBJSTORE_PUBLIC_BUCKET" to "avatars",
+        "IM_OBJSTORE_PUBLIC_BASE_URL" to "$endpoint/avatars",
+        "IM_OBJSTORE_ACCESS_KEY" to "sdk-it-access",
+        "IM_OBJSTORE_SECRET_KEY" to "sdk-it-secret-not-real",
+    )
+
+    fun stop() {
+        runCatching { proc.outputStream.close() } // 假 S3 在 stdin 关闭时退出
+        proc.destroy()
+        proc.waitFor()
+    }
+
+    companion object {
+        fun start(): FakeS3 {
+            val script = File(FakeS3::class.java.getResource("/fake_s3.py")!!.toURI())
+            val proc = ProcessBuilder("python3", "-I", script.absolutePath).redirectError(ProcessBuilder.Redirect.DISCARD).start()
+            val line = proc.inputStream.bufferedReader().readLine() ?: error("fake S3 did not start")
+            val port = Regex("port (\\d+)").find(line)!!.groupValues[1]
+            return FakeS3(proc, "http://127.0.0.1:$port")
+        }
+    }
+}
+
 class TestServer private constructor(private val proc: Process, private val adminPort: Int, val wsURL: String) {
     private val http = HttpClient.newHttpClient()
+
+    /** http://127.0.0.1:端口（/v1 接口）。 */
+    val httpURL: String get() = wsURL.replace("ws://", "http://").removeSuffix("/ws")
 
     fun admin(method: String, path: String, body: JsonObject? = null): JsonObject {
         val b = HttpRequest.newBuilder(URI("http://127.0.0.1:$adminPort$path"))

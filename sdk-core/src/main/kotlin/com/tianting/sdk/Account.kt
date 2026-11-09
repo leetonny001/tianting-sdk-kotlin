@@ -278,7 +278,7 @@ private const val PATH_LOGOUT = "/v1/account/logout"
  * - 新 token 先落盘再使用；恢复码确认之前只放内存。
  * - token、refresh、恢复码不进 URL，不进日志，不进错误信息。
  */
-public class AccountClient(private val o: AccountClientOptions) {
+public class AccountClient(private val o: AccountClientOptions) : FileAuth {
     private val executor: ExecutorService? = if (o.dispatcher == null) {
         Executors.newSingleThreadExecutor { r -> Thread(r, "tianting-account").apply { isDaemon = true } }
     } else {
@@ -466,6 +466,11 @@ public class AccountClient(private val o: AccountClientOptions) {
         }
         if (source == RefreshSource.KICKED) {
             if (isLocalNewer(lineage, rejected ?: RejectedToken())) return record(SessionOutcome.UseLocal)
+            // access 的到期就是绝对上限（P-35 L1）：刷新换不来更晚的 token，服务端在上限那一秒踢 tokenExpired 时直接登录失效，不再问一次。
+            if (s.absoluteExpiresAt != null && s.accessExpiresAt == s.absoluteExpiresAt) {
+                endSession(SessionEnd(SessionEndAction.LOGIN, SessionDialog.SESSION_EXPIRED, reason = "expired"))
+                return record(SessionOutcome.Login(SessionDialog.SESSION_EXPIRED))
+            }
             mustRefresh = true
         }
         return record(decideRefresh(source))
@@ -1136,6 +1141,12 @@ public class AccountClient(private val o: AccountClientOptions) {
         put("platform", o.platform.wire)
         o.deviceName?.let { put("deviceName", it) }
     }
+
+    /**
+     * 带 Bearer 的其他 /v1 接口（文件接口用，PRD-chat F-FILE-01、04，RS5-10：HTTP 和 WS 共用 token）。
+     * 4011 的处理同账号接口（规则 7）：本地更新就用本地值重试，否则等一次刷新，同一请求最多重试 2 次。实现了 FileAuth。
+     */
+    override suspend fun authorized(method: String, path: String, body: JsonElement?): JsonElement = onAccount { authed(method, path, body) }
 
     /** 不在队列里的带 Bearer 请求：带旧 token 得到 4011 时用本地值重试，或者等一次刷新（规则 7）。 */
     private suspend fun authed(method: String, path: String, body: JsonElement? = null): JsonElement {

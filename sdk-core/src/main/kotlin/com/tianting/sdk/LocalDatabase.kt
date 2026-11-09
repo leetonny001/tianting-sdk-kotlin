@@ -17,7 +17,7 @@ public interface LocalDatabase : Closeable {
     public fun <T> transaction(block: () -> T): T
 }
 
-private const val SCHEMA_VERSION = 1L
+private const val SCHEMA_VERSION = 2L
 
 /** 冷启动时每个会话最多恢复多少条消息，更早的从库里删掉，靠向上翻页。 */
 internal const val RESTORE_LIMIT_PER_CONV = 200
@@ -27,6 +27,8 @@ internal class DeletedRefs(
     val ids: MutableSet<String> = HashSet(),
     val seqs: MutableSet<Long> = HashSet(),
     val removedClient: MutableSet<String> = HashSet(),
+    /** 文件已过期的 msgId（F-RCL-03 规则 2a：expired 只能从假变真，跨冷启动保留）。 */
+    val expired: MutableSet<String> = HashSet(),
 )
 
 /** 从本地库恢复出来的全部状态。 */
@@ -43,6 +45,25 @@ internal class RestoredState(
     val friends: List<FriendItem>,
     val requests: List<RequestItem>,
     val blocks: List<BlockItem>,
+    /** 还没发出去的附件的沙盒副本（F-FILE-07 规则 2）。 */
+    val attachments: List<AttachmentRecord> = emptyList(),
+    /** 最近一次重拉时各会话的 modVer（F-RCL-03 规则 2）。 */
+    val modVers: Map<String, Long> = emptyMap(),
+)
+
+/** 一条附件消息的沙盒副本（文件在 attachmentDir 里，按 clientMsgId 定位）。name 是文件名，和消息正文一样只在本地库。 */
+@kotlinx.serialization.Serializable
+internal data class AttachmentRecord(
+    val convId: String,
+    val clientMsgId: String,
+    val kind: String,
+    val name: String,
+    val mime: String,
+    val thumbMime: String? = null,
+    val width: Int? = null,
+    val height: Int? = null,
+    /** 原文件、缩略图已经复制进沙盒。处理中被打断的没有。 */
+    val copied: Boolean = false,
 )
 
 /**
@@ -67,7 +88,14 @@ internal class LocalDb(private val db: LocalDatabase, private val log: Logger) :
         secureDeleteOk = (db.query("PRAGMA secure_delete=ON").firstOrNull()?.values?.firstOrNull() as? Long) == 1L
         db.query("PRAGMA journal_mode=DELETE")
         val version = db.query("PRAGMA user_version").firstOrNull()?.values?.firstOrNull() as? Long ?: 0L
-        if (version != SCHEMA_VERSION) {
+        if (version == 1L) {
+            // 第 1 版 → 第 2 版（FE-631，C2）：加附件沙盒和 modVer 两张表，原有的会话、消息（含待发、失败）、社交数据都保留。
+            // 新的发送状态（处理中、上传中）和消息的 image、file 都在 json 列里，旧行照常解码。
+            db.transaction {
+                createV2Tables()
+                db.execute("PRAGMA user_version = $SCHEMA_VERSION")
+            }
+        } else if (version != SCHEMA_VERSION) {
             // 本地库只是缓存，服务端是真相源：版本不同直接重建。
             for (t in TABLES) db.execute("DROP TABLE IF EXISTS $t")
             createTables()
@@ -84,6 +112,12 @@ internal class LocalDb(private val db: LocalDatabase, private val log: Logger) :
         db.execute("CREATE TABLE friends(user_id TEXT PRIMARY KEY, ver INTEGER NOT NULL, json TEXT NOT NULL)")
         db.execute("CREATE TABLE friend_requests(user_id TEXT NOT NULL, direction TEXT NOT NULL, ver INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY(user_id, direction))")
         db.execute("CREATE TABLE blocks(user_id TEXT PRIMARY KEY, ver INTEGER NOT NULL, json TEXT NOT NULL)")
+        createV2Tables()
+    }
+
+    private fun createV2Tables() {
+        db.execute("CREATE TABLE attachments(client_msg_id TEXT PRIMARY KEY, conv_id TEXT NOT NULL, json TEXT NOT NULL)")
+        db.execute("CREATE TABLE mod_vers(conv_id TEXT PRIMARY KEY, mod_ver INTEGER NOT NULL)")
     }
 
     /**
@@ -232,6 +266,28 @@ internal class LocalDb(private val db: LocalDatabase, private val log: Logger) :
         for (id in clientMsgIds) db.execute("INSERT OR IGNORE INTO deleted_refs(conv_id, kind, ref) VALUES(?, 'client', ?)", listOf(convId, id))
     }
 
+    override fun addExpiredRefs(convId: String, msgIds: Collection<String>) = guarded {
+        for (id in msgIds) db.execute("INSERT OR IGNORE INTO deleted_refs(conv_id, kind, ref) VALUES(?, 'expired', ?)", listOf(convId, id))
+    }
+
+    // ---- 附件和 modVer（FE-631） ----
+
+    fun saveAttachment(a: AttachmentRecord) = guarded {
+        db.execute(
+            "INSERT OR REPLACE INTO attachments(client_msg_id, conv_id, json) VALUES(?, ?, ?)",
+            listOf(a.clientMsgId, a.convId, ImJson.encodeToString(AttachmentRecord.serializer(), a)),
+        )
+    }
+
+    fun deleteAttachment(clientMsgId: String) = guarded {
+        db.execute("DELETE FROM attachments WHERE client_msg_id = ?", listOf(clientMsgId))
+        markDirty()
+    }
+
+    fun setModVer(convId: String, modVer: Long) = guarded {
+        db.execute("INSERT OR REPLACE INTO mod_vers(conv_id, mod_ver) VALUES(?, ?)", listOf(convId, modVer))
+    }
+
     // ---- 社交 ----
 
     override fun upsertFriend(f: FriendItem) = guarded {
@@ -316,6 +372,7 @@ internal class LocalDb(private val db: LocalDatabase, private val log: Logger) :
                 "id" -> e.ids.add(r["ref"] as String)
                 "seq" -> e.seqs.add((r["ref"] as String).toLong())
                 "client" -> e.removedClient.add(r["ref"] as String)
+                "expired" -> e.expired.add(r["ref"] as String)
             }
         }
         val meta = db.query("SELECT social_ver, request_seen_ver, settings, official, loaded FROM social_meta").firstOrNull()
@@ -332,6 +389,8 @@ internal class LocalDb(private val db: LocalDatabase, private val log: Logger) :
             friends = db.query("SELECT json FROM friends").map { ImJson.decodeFromString(FriendItem.serializer(), it["json"] as String) },
             requests = db.query("SELECT json FROM friend_requests").map { ImJson.decodeFromString(RequestItem.serializer(), it["json"] as String) },
             blocks = db.query("SELECT json FROM blocks").map { ImJson.decodeFromString(BlockItem.serializer(), it["json"] as String) },
+            attachments = db.query("SELECT json FROM attachments").map { ImJson.decodeFromString(AttachmentRecord.serializer(), it["json"] as String) },
+            modVers = db.query("SELECT conv_id, mod_ver FROM mod_vers").associate { it["conv_id"] as String to it["mod_ver"] as Long },
         )
     }
 
@@ -344,6 +403,6 @@ internal class LocalDb(private val db: LocalDatabase, private val log: Logger) :
     }
 
     private companion object {
-        val TABLES = listOf("meta", "conversations", "messages", "deleted_refs", "social_meta", "friends", "friend_requests", "blocks")
+        val TABLES = listOf("meta", "conversations", "messages", "deleted_refs", "social_meta", "friends", "friend_requests", "blocks", "attachments", "mod_vers")
     }
 }

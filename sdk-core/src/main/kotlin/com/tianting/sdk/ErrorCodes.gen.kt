@@ -40,6 +40,7 @@ public object ErrorCode {
     public const val FRIEND_REQUEST_HANDLED: Int = 4091
     public const val PUSH_ID_CONFLICT: Int = 4094
     public const val USERNAME_TAKEN: Int = 4095
+    public const val FILE_NOT_READY: Int = 4096
     public const val GROUP_MEMBER_LIMIT_EXCEEDED: Int = 4130
     public const val BATCH_LIMIT_EXCEEDED: Int = 4131
     public const val FRIEND_LIMIT_EXCEEDED: Int = 4132
@@ -48,11 +49,14 @@ public object ErrorCode {
     public const val JOINED_GROUP_LIMIT_EXCEEDED: Int = 4135
     public const val GROUP_ADMIN_LIMIT_EXCEEDED: Int = 4136
     public const val STRANGER_MSG_LIMIT: Int = 4137
+    public const val FILE_TOO_LARGE: Int = 4139
+    public const val FILE_TYPE_NOT_ALLOWED: Int = 4150
     public const val RATE_LIMITED: Int = 4290
     public const val QUOTA_EXCEEDED: Int = 4292
     public const val ACCOUNT_LOGIN_LOCKED: Int = 4294
     public const val INTERNAL: Int = 5000
     public const val SERVICE_UNAVAILABLE: Int = 5030
+    public const val OBJECT_STORE_UNAVAILABLE: Int = 5032
 }
 
 /** 错误码的详细信息：是否可以重试、给开发者的说明。 */
@@ -94,6 +98,7 @@ internal val ERROR_INFO: Map<Int, ErrorInfo> = mapOf(
     4091 to ErrorInfo("FRIEND_REQUEST_HANDLED", false, "申请已同意"),
     4094 to ErrorInfo("PUSH_ID_CONFLICT", false, "同一 pushId 的调用方或内容不同"),
     4095 to ErrorInfo("USERNAME_TAKEN", false, "用户名已存在或保留"),
+    4096 to ErrorInfo("FILE_NOT_READY", false, "文件未完成上传，或已绑定其他消息"),
     4130 to ErrorInfo("GROUP_MEMBER_LIMIT_EXCEEDED", false, "群成员已达上限"),
     4131 to ErrorInfo("BATCH_LIMIT_EXCEEDED", false, "单次批量操作数量超限"),
     4132 to ErrorInfo("FRIEND_LIMIT_EXCEEDED", false, "好友数量已达上限"),
@@ -102,11 +107,14 @@ internal val ERROR_INFO: Map<Int, ErrorInfo> = mapOf(
     4135 to ErrorInfo("JOINED_GROUP_LIMIT_EXCEEDED", false, "加入的群聊已达上限"),
     4136 to ErrorInfo("GROUP_ADMIN_LIMIT_EXCEEDED", false, "管理员已满 10 人"),
     4137 to ErrorInfo("STRANGER_MSG_LIMIT", false, "对方回复前的条数已用完"),
+    4139 to ErrorInfo("FILE_TOO_LARGE", false, "超过大小限制（details.maxBytes）"),
+    4150 to ErrorInfo("FILE_TYPE_NOT_ALLOWED", false, "禁止的类型或内容与声明不符"),
     4290 to ErrorInfo("RATE_LIMITED", true, "操作过于频繁"),
     4292 to ErrorInfo("QUOTA_EXCEEDED", false, "今天的次数已用完"),
     4294 to ErrorInfo("ACCOUNT_LOGIN_LOCKED", false, "尝试过多，暂时锁定（details.retryAfterSeconds）"),
     5000 to ErrorInfo("INTERNAL", true, "服务器内部错误"),
     5030 to ErrorInfo("SERVICE_UNAVAILABLE", true, "服务暂不可用"),
+    5032 to ErrorInfo("OBJECT_STORE_UNAVAILABLE", true, "对象存储暂不可用（reason: completeInProgress 是同一上传的 complete 正在进行）"),
 )
 
 /** client scope 的错误码：账号和文件的 HTTP 接口会返回（PRD-chat 第 11.5 节，F-SYS-01）。 */
@@ -122,20 +130,26 @@ public val CLIENT_ERROR_CODES: Set<Int> = setOf(
     4030,
     4034,
     4095,
+    4096,
+    4131,
+    4139,
+    4150,
     4290,
     4292,
     4294,
     5000,
     5030,
+    5032,
 )
 
 /** 错误码 → 细分的 reason（PRD-chat 第 11.5 节）。收到没有列出的 reason 不能报错。 */
 public val ERROR_REASONS: Map<Int, List<String>> = mapOf(
-    4000 to listOf("passwordWeak", "recoveryCodeStale"),
+    4000 to listOf("passwordWeak", "recoveryCodeStale", "fileKindMismatch", "uploadMismatch", "fileNameTooLong"),
     4011 to listOf("tokenSuperseded"),
     4019 to listOf("invalid", "expired", "revoked", "superseded", "replayDetected", "credentialsChanged", "loggedOutOthers", "accountDeleted"),
     4030 to listOf("registerClosed", "inviteInvalid", "accountSessionRequired", "accountExists", "accountDeletionPending", "featureDisabled"),
-    4290 to listOf("recoverLimited"),
+    4290 to listOf("recoverLimited", "uploadPendingLimit"),
+    5032 to listOf("completeInProgress"),
 )
 
 /** WebSocket 关闭码。 */

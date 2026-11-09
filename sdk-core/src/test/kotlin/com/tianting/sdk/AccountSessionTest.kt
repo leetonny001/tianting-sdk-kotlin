@@ -972,6 +972,44 @@ class AccountSessionTest : AccountTest() {
     }
 
     @Test
+    fun `P-35 L1 上限前最后一秒服务端踢 kicked tokenExpired：直接登录失效，不发刷新、不重连`() {
+        val a = setupAccount()
+        val at = capped(a)
+        val c = a.online()
+        a.clock.advance(at - a.clock.now() - 400) // JWT 的 exp 只到秒：服务端比本地的上限早不到 1 秒踢
+        a.kicked(c, "tokenExpired", code = 4011)
+        assertEquals(SessionDialog.SESSION_EXPIRED, a.ended.single().dialog)
+        assertEquals("expired", a.ended.single().reason)
+        assertEquals(SessionDialog.SESSION_EXPIRED, (a.fatals().single() as FatalReason.Session).end.dialog)
+        assertNull(a.current)
+        a.clock.advance(120_000)
+        assertEquals(1, a.http.to(REFRESH).size) // 只有 capped 里那一次
+        assertEquals(1, a.transport.connections.size)
+    }
+
+    @Test
+    fun `P-35 L1 只有关闭码 4011（没有 kicked 帧）同样不刷新`() {
+        val a = setupAccount()
+        val at = capped(a)
+        val c = a.online()
+        a.clock.advance(at - a.clock.now() - 400)
+        c.drop(4011)
+        assertEquals(SessionDialog.SESSION_EXPIRED, a.ended.single().dialog)
+        a.clock.advance(120_000)
+        assertEquals(1, a.http.to(REFRESH).size)
+        assertEquals(1, a.transport.connections.size)
+    }
+
+    @Test
+    fun `P-35 L1 只看到期等于上限：普通 token 的 kicked tokenExpired 仍然刷新一次`() {
+        val a = setupAccount()
+        a.session(1, DAY)
+        a.kicked(a.online(), "tokenExpired", code = 4011)
+        assertEquals(1, a.http.to(REFRESH).size)
+        assertEquals(emptyList(), a.ended)
+    }
+
+    @Test
     fun `TC-ACC-03-45 没有连接：到期后回前台或拨号都回登录页，不发刷新`() {
         val a = setupAccount()
         capped(a)

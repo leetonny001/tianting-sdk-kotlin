@@ -12,16 +12,28 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 
-/** 发送状态（PRD F-MSG-03）。QUEUED：离线时进入待发队列；服务端来的消息都是 SENT。 */
+/**
+ * 发送状态（PRD F-MSG-03；附件见 PRD-chat F-FILE-07）。服务端来的消息都是 SENT。
+ * 附件：PROCESSING（App 在处理图片）→ UPLOADING（申请、PUT、complete）→ QUEUED（待发送：已 complete，等连接）→ SENDING → SENT；
+ * 任何一步可以转 FAILED。文本没有前两种。冷启动时 PROCESSING、UPLOADING 一律转 FAILED，不自动上传（规则 3）。
+ */
 @Serializable
-public enum class MessageStatus { QUEUED, SENDING, SENT, FAILED }
+public enum class MessageStatus { QUEUED, SENDING, SENT, FAILED, PROCESSING, UPLOADING }
 
-/** 发送失败的原因：错误码，或超时、被踢。 */
+/**
+ * 发送失败的原因：错误码（4292 上传额度用完、4290 + errorReason=uploadPendingLimit、4139、4150、4096、5032…），
+ * 或超时、被踢、Network（上传时网络或对象存储出错，或上传被进程结束打断）、Process（App 处理图片失败："无法处理这张图片，请用文件方式发送"）、
+ * Storage（复制到沙盒失败："存储空间不足"）、SourceMissing（要重新上传但沙盒副本已不在："原文件已不可用，请重新选择"）。
+ */
 @Serializable(with = SendErrorSerializer::class)
 public sealed interface SendError {
     public data class Code(val code: Int) : SendError
     public data object Timeout : SendError
     public data object Kicked : SendError
+    public data object Network : SendError
+    public data object Process : SendError
+    public data object Storage : SendError
+    public data object SourceMissing : SendError
 }
 
 internal object SendErrorSerializer : KSerializer<SendError> {
@@ -29,7 +41,14 @@ internal object SendErrorSerializer : KSerializer<SendError> {
 
     override fun deserialize(decoder: Decoder): SendError {
         val p = (decoder as JsonDecoder).decodeJsonElement() as JsonPrimitive
-        return p.intOrNull?.let { SendError.Code(it) } ?: if (p.contentOrNull == "kicked") SendError.Kicked else SendError.Timeout
+        return p.intOrNull?.let { SendError.Code(it) } ?: when (p.contentOrNull) {
+            "kicked" -> SendError.Kicked
+            "network" -> SendError.Network
+            "process" -> SendError.Process
+            "storage" -> SendError.Storage
+            "sourceMissing" -> SendError.SourceMissing
+            else -> SendError.Timeout
+        }
     }
 
     override fun serialize(encoder: Encoder, value: SendError) {
@@ -37,6 +56,10 @@ internal object SendErrorSerializer : KSerializer<SendError> {
             is SendError.Code -> JsonPrimitive(value.code)
             SendError.Timeout -> JsonPrimitive("timeout")
             SendError.Kicked -> JsonPrimitive("kicked")
+            SendError.Network -> JsonPrimitive("network")
+            SendError.Process -> JsonPrimitive("process")
+            SendError.Storage -> JsonPrimitive("storage")
+            SendError.SourceMissing -> JsonPrimitive("sourceMissing")
         }
         (encoder as JsonEncoder).encodeJsonElement(e)
     }
@@ -56,6 +79,8 @@ public data class Message(
     val ts: Long,
     val status: MessageStatus,
     val error: SendError? = null,
+    /** 错误码的 reason（例如 4290 的 uploadPendingLimit）。 */
+    val errorReason: String? = null,
     /** 被删除（PRD-admin F-ADM-31）：seq、msgId、发送者、时间都保留，body 为空。 */
     val deleted: Boolean = false,
     val deletedAt: Long? = null,
@@ -75,6 +100,8 @@ public data class Conversation(
     val updatedAt: Long,
     val memberCount: Int? = null,
     val myRole: GroupRole? = null,
+    /** 已有消息展示内容的版本号（F-RCL-03 规则 2）；老服务端没有。 */
+    val modVer: Long? = null,
 )
 
 /**
@@ -100,6 +127,7 @@ internal interface StoreSink {
     fun wipeMessage(m: Message)
     fun addDeletedRefs(convId: String, msgIds: Collection<String>, seqs: Collection<Long>)
     fun addRemovedClient(convId: String, clientMsgIds: Collection<String>)
+    fun addExpiredRefs(convId: String, msgIds: Collection<String>)
     fun <T> transaction(block: () -> T): T
 }
 
@@ -113,10 +141,18 @@ internal object NoStoreSink : StoreSink {
     override fun wipeMessage(m: Message) = Unit
     override fun addDeletedRefs(convId: String, msgIds: Collection<String>, seqs: Collection<Long>) = Unit
     override fun addRemovedClient(convId: String, clientMsgIds: Collection<String>) = Unit
+    override fun addExpiredRefs(convId: String, msgIds: Collection<String>) = Unit
     override fun <T> transaction(block: () -> T): T = block()
 }
 
 private const val SUMMARY_LEN = 100
+
+/** 过期后的内容：标记 expired，文件名清空（服务端同样清空，F-FILE-06 规则 3）。 */
+internal fun expireBody(body: MsgBody): MsgBody = when {
+    body.image != null -> body.copy(image = body.image.copy(expired = true))
+    body.file != null -> body.copy(file = body.file.copy(expired = true, name = ""))
+    else -> body
+}
 
 /** 被删除的最后一条消息的摘要：不保留原文。 */
 private fun deletedLast(msgId: String, from: String, type: MsgType, ts: Long) = LastMsg(msgId, from, type, null, ts, deleted = true)
@@ -132,6 +168,12 @@ internal class MessageList(private val convId: String, private val self: () -> S
     private val deletedIds = HashSet<String>()
     private val deletedSeqs = HashSet<Long>()
 
+    // 已知文件已过期的 msgId（F-FILE-06 规则 3）：expired 只能从假变真，迟到的旧 sync 不能把它改回去（F-RCL-03 规则 2a）。
+    private val expiredIds = HashSet<String>()
+
+    /** 这次合并里刚变成过期或被删除的 fileId，由 Store 取走（清地址和文件缓存用）。 */
+    val newlyExpired = LinkedHashSet<String>()
+
     // 本地删除过的失败消息（G-UI-14）：它可能其实到了服务端，之后的 ack、sync 不能让它再出现。
     // 只认自己发的：clientMsgId 对同群成员可见，别人用同一个值发的消息不能被藏起来。
     private val removedClient = HashSet<String>()
@@ -146,19 +188,35 @@ internal class MessageList(private val convId: String, private val self: () -> S
 
     /**
      * 合并服务端消息；按 msgId 去重，按 clientMsgId 合并本地待发消息。
-     * 已有的消息只会变成已删除。返回合并后的消息，没有变化时为 null。
+     * 已有的消息单调合并（F-RCL-03 规则 2a）：deleted、文件的 expired 只能从假变真，deletedIds 优先；
+     * 迟到的旧 sync 应答带着原文或 expired=false 时不回写。返回合并后的消息，没有变化时为 null。
      */
     fun addServer(m: ServerMessage): Message? {
         if (m.clientMsgId in removedClient && m.from == self()) return null
         val deleted = m.deleted || isDeleted(m.msgId, m.seq)
         if (m.msgId in byMsgId) {
             val old = bySeq[m.seq]
-            return if (deleted && old != null && !old.deleted) wipe(old, m.deletedAt) else null
+            if (old == null || old.deleted) return null
+            if (deleted) return wipe(old, m.deletedAt)
+            if (m.body?.fileExpired == true && !old.body.fileExpired) {
+                markExpired(m.msgId, old.body)
+                val next = old.copy(body = expireBody(old.body))
+                bySeq[old.seq!!] = next
+                byClient[old.clientMsgId] = next
+                sink.upsertMessage(next)
+                return next
+            }
+            return null
         }
         val local = byClient[m.clientMsgId]
         if (local != null && local.seq == null && local.from == m.from) {
             unsent.remove(local)
             sink.deleteUnsent(convId, m.clientMsgId)
+        }
+        var body = m.body ?: MsgBody()
+        if (!deleted && (body.fileExpired || m.msgId in expiredIds)) {
+            if (m.msgId !in expiredIds) markExpired(m.msgId, body)
+            body = expireBody(body)
         }
         val msg = Message(
             clientMsgId = m.clientMsgId,
@@ -167,7 +225,7 @@ internal class MessageList(private val convId: String, private val self: () -> S
             convId = m.convId,
             from = m.from,
             type = m.type,
-            body = if (deleted) MsgBody() else m.body ?: MsgBody(),
+            body = if (deleted) MsgBody() else body,
             ts = m.ts,
             status = MessageStatus.SENT,
             deleted = deleted,
@@ -180,6 +238,15 @@ internal class MessageList(private val convId: String, private val self: () -> S
         if (deleted) sink.wipeMessage(msg) else sink.upsertMessage(msg)
         return msg
     }
+
+    private fun markExpired(msgId: String, body: MsgBody) {
+        expiredIds.add(msgId)
+        sink.addExpiredRefs(convId, listOf(msgId))
+        body.fileId?.takeIf { it.isNotEmpty() }?.let { newlyExpired.add(it) }
+    }
+
+    fun hasExpiredFile(fileId: String): Boolean =
+        bySeq.values.any { it.body.fileId == fileId && it.body.fileExpired }
 
     fun isDeleted(msgId: String, seq: Long? = null): Boolean = msgId in deletedIds || (seq != null && seq in deletedSeqs)
 
@@ -199,6 +266,7 @@ internal class MessageList(private val convId: String, private val self: () -> S
     }
 
     private fun wipe(old: Message, deletedAt: Long?): Message {
+        old.body.fileId?.takeIf { it.isNotEmpty() }?.let { newlyExpired.add(it) } // 文件的缓存同样要清（F-RCL-03 规则 3）
         val next = old.copy(body = MsgBody(), deleted = true, deletedAt = deletedAt ?: old.deletedAt)
         bySeq[old.seq!!] = next
         byClient[old.clientMsgId] = next
@@ -221,9 +289,12 @@ internal class MessageList(private val convId: String, private val self: () -> S
     fun local(clientMsgId: String): Message? = byClient[clientMsgId]
 
     /** 移除一条失败的本地消息，并记住它的 clientMsgId（本地库里也记，冷启动后同样不会复活）。不是失败状态时不动，返回 false。 */
-    fun removeFailed(clientMsgId: String): Boolean {
+    fun removeFailed(clientMsgId: String): Boolean = removeUnsent(clientMsgId, setOf(MessageStatus.FAILED))
+
+    /** 移除一条还没有 seq、状态在 statuses 里的本地消息（取消上传，F-FILE-07、AC-FILE-02-5），并记住 clientMsgId。 */
+    fun removeUnsent(clientMsgId: String, statuses: Set<MessageStatus>): Boolean {
         val m = byClient[clientMsgId] ?: return false
-        if (m.status != MessageStatus.FAILED || m.seq != null) return false
+        if (m.status !in statuses || m.seq != null) return false
         unsent.remove(m)
         byClient.remove(clientMsgId)
         removedClient.add(clientMsgId)
@@ -256,7 +327,8 @@ internal class MessageList(private val convId: String, private val self: () -> S
         sink.clearServerMessages(convId)
     }
 
-    fun pendingMessages(): List<Message> = unsent.filter { it.status == MessageStatus.QUEUED || it.status == MessageStatus.SENDING }
+    /** 还在进行中的本地消息（处理、上传、排队、发送中）。 */
+    fun pendingMessages(): List<Message> = unsent.filter { it.status != MessageStatus.FAILED && it.status != MessageStatus.SENT }
 
     fun snapshot(): List<Message> = bySeq.values.sortedBy { it.seq } + unsent
 
@@ -270,6 +342,7 @@ internal class MessageList(private val convId: String, private val self: () -> S
         for (m in unsent) sink.upsertMessage(m)
         sink.addDeletedRefs(convId, deletedIds, deletedSeqs)
         sink.addRemovedClient(convId, removedClient)
+        sink.addExpiredRefs(convId, expiredIds)
     }
 
     // ---- 冷启动恢复：只改内存，不再写回本地库 ----
@@ -289,6 +362,7 @@ internal class MessageList(private val convId: String, private val self: () -> S
         deletedIds.addAll(refs.ids)
         deletedSeqs.addAll(refs.seqs)
         removedClient.addAll(refs.removedClient)
+        expiredIds.addAll(refs.expired)
     }
 }
 
@@ -388,7 +462,7 @@ internal class Store(private val self: () -> String, private val sink: StoreSink
         val view = Conversation(
             c.convId, c.type, c.name, c.maxSeq, c.readSeq, c.minSeq, c.unread,
             if (stale) deletedLast(last!!.msgId, last.from, last.type, last.ts) else last,
-            c.updatedAt, c.memberCount, c.myRole,
+            c.updatedAt, c.memberCount, c.myRole, c.modVer,
         )
         // 同一内容保留原对象（G-UI-19）：500 个会话刷新一次，没变的引用不变。
         val old = convs[c.convId]?.view
@@ -469,6 +543,21 @@ internal class Store(private val self: () -> String, private val sink: StoreSink
         }
         return changed
     }
+
+    /** 取走合并时刚变成过期（或被删除）的文件的 fileId：调用方清地址和文件缓存（F-FILE-06 规则 3、AC-FILE-06-12）。 */
+    fun takeExpiredFiles(): List<String> {
+        val out = ArrayList<String>()
+        for (l in msgs.values) {
+            out.addAll(l.newlyExpired)
+            l.newlyExpired.clear()
+        }
+        return out
+    }
+
+    /** 这个文件是否已知过期（申请地址前看一眼，AC-FILE-06-6：不发申请地址的请求）。 */
+    fun fileExpired(fileId: String): Boolean = msgs.values.any { it.hasExpiredFile(fileId) }
+
+    fun isLoaded(convId: String): Boolean = (msgs[convId]?.oldestSeq ?: 0L) > 0L
 
     data class LoadedRange(val convId: String, val from: Long, val to: Long)
 
