@@ -162,7 +162,8 @@ public data class AccountConfig(
     val privacyNotice: PrivacyNotice? = null,
 ) {
     @Serializable
-    public data class Features(val files: Boolean)
+    /** msgActions：撤回、引用、@（C4，服务端 IM_MSG_ACTIONS_ENABLED）；老服务端没有这个字段，按关闭处理（PRD-ui F-UI-09 规则 4，问题 36）。 */
+    public data class Features(val files: Boolean, val msgActions: Boolean = false)
 
     @Serializable
     public data class Limits(
