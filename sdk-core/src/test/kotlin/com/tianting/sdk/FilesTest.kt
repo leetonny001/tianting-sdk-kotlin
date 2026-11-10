@@ -5,6 +5,7 @@ package com.tianting.sdk
 import com.tianting.sdk.jdbc.JdbcLocalDatabase
 import com.tianting.sdk.testing.FakeConnection
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -659,6 +660,18 @@ class FilesTest : AccountTest() {
 
     private fun urlItem(fileId: String, variant: String, now: Long) =
         obj("fileId" to fileId, "variant" to variant, "url" to "https://s3.test/chat/final/$fileId/$variant?$SIG", "expiresAt" to now + 120_000)
+
+    @Test
+    fun `申请地址带 bareDisposition true（PRD-chat v1_7 F-FILE-03 规则 4，P-45，TC-FILE-01-25 第 3 步）`() {
+        val (a, _) = online()
+        val p = a.h.callScope.async { a.im.getFileUrls(listOf(FileUrlItem("F1", FileVariant.ORIGINAL))) }
+        a.h.flush()
+        val call = a.http.last(URLS)
+        assertEquals(true, call.json["bareDisposition"]?.jsonPrimitive?.booleanOrNull)
+        assertEquals(1, call.json["items"]!!.jsonArray.size)
+        call.respond(200, obj("items" to listOf(urlItem("F1", "original", a.clock.now()))))
+        a.h.await(p)
+    }
 
     @Test
     fun `60 项分成 50 + 10 两批；同一轮的两次调用合并；第二次（没到期）不再请求；剩余不到 15 秒重新申请`() {

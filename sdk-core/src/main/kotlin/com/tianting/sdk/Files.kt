@@ -356,7 +356,7 @@ public class FileClient(
         }
     }
 
-    /** POST /v1/files/urls，一批 ≤ 50 项。不可访问的项 code=4048。 */
+    /** POST /v1/files/urls，一批 ≤ 50 项，带 `bareDisposition: true`。不可访问的项 code=4048。 */
     public suspend fun urls(items: List<FileUrlItem>): List<FileUrlResult> {
         require(items.size <= URLS_BATCH)
         val body = buildJsonObject {
@@ -366,6 +366,8 @@ public class FileClient(
                     for (i in items) add(buildJsonObject { put("fileId", i.fileId); put("variant", i.variant.wire) })
                 },
             )
+            // 原生 App 自己定保存的文件名：文件地址只签 attachment、不带文件名，系统网络日志里就没有它（PRD-chat v1.7 F-FILE-03 规则 4，P-45）
+            put("bareDisposition", true)
         }
         val r = auth.authorized("POST", "/v1/files/urls", body) as? JsonObject
         val got = (r?.get("items") as? kotlinx.serialization.json.JsonArray)?.mapNotNull { it as? JsonObject } ?: emptyList()
