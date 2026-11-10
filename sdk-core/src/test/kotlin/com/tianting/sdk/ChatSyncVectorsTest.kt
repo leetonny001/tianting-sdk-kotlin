@@ -66,13 +66,33 @@ class ChatSyncVectorsTest : SdkTest() {
         return js(base).jsonObject
     }
 
+    /** C5：minSeq 不写是 1，unread、updatedAt 不写是 0，readSeq = maxSeq − unread（问题 69）；pinned、pinnedAt、notifyOff 原样带上。 */
     private fun wireConv(c: JsonObject): JsonObject {
         val maxSeq = c["maxSeq"]!!.jsonPrimitive.long
-        val base = conv(c["convId"]!!.str, maxSeq = maxSeq, readSeq = maxSeq, modVer = c["modVer"]?.jsonPrimitive?.long)
-        val mu = c["mentionUnread"]?.jsonPrimitive?.long ?: return base
-        val extra = linkedMapOf<String, Any?>("mentionUnread" to mu)
-        if (mu > 0) extra["firstMentionSeq"] = maxSeq
+        val unread = c["unread"]?.jsonPrimitive?.long ?: 0
+        val base = conv(
+            c["convId"]!!.str, maxSeq = maxSeq, readSeq = maxSeq - unread, minSeq = c["minSeq"]?.jsonPrimitive?.long ?: 1, unread = unread,
+            updatedAt = c["updatedAt"]?.jsonPrimitive?.long ?: 0, modVer = c["modVer"]?.jsonPrimitive?.long,
+        )
+        val extra = linkedMapOf<String, Any?>()
+        for (k in listOf("pinned", "pinnedAt", "notifyOff")) c[k]?.let { extra[k] = it }
+        val mu = c["mentionUnread"]?.jsonPrimitive?.long
+        if (mu != null) {
+            extra["mentionUnread"] = mu
+            if (mu > 0) extra["firstMentionSeq"] = maxSeq
+        }
         return JsonObject(base + extra.mapValues { js(it.value) })
+    }
+
+    /** C5 期望的 convState：列表里每个会话的 minSeq、unread，有设置时再带 pinned、pinnedAt、notifyOff。 */
+    private fun convState(c: Conversation): JsonObject {
+        val m = linkedMapOf<String, Any?>("minSeq" to c.minSeq, "unread" to c.unread)
+        if (c.pinned) {
+            m["pinned"] = true
+            m["pinnedAt"] = c.pinnedAt
+        }
+        if (c.notifyOff) m["notifyOff"] = true
+        return js(m).jsonObject
     }
 
     /** SDK 看到的消息，按用例的写法比较。删除的消息只比较 seq、type、deleted、recalled、recalledBy，正文必须已清空。 */
@@ -158,7 +178,16 @@ class ChatSyncVectorsTest : SdkTest() {
                 "connect" -> {
                     val prev = c
                     if (prev != null) h.clock.advance(1_000) else h.connect("token-value") // 退避后重连
-                    c = h.login(self, list(st["convs"]).map { wireConv(it) })
+                    c = h.transport.current
+                    c!!.open()
+                    c!!.ack("auth", obj("userId" to self, "serverTime" to h.clock.now()))
+                    // C5：convs 应答再带这一步的 truncated、deleted、deletedTruncated。
+                    val data = linkedMapOf<String, Any?>("convs" to list(st["convs"]).map { wireConv(it) }, "truncated" to (st["truncated"] ?: false))
+                    st["deleted"]?.let { data["deleted"] = it }
+                    st["deletedTruncated"]?.let { data["deletedTruncated"] = it }
+                    val ack = obj("id" to c!!.last("convs")["id"]!!.str, "cmd" to "ack", "data" to js(data))
+                    assertEquals(emptyList(), FrameSchema.errors(ack.toString()), ack.toString())
+                    c!!.receive(ack)
                     if (prev != null) assertNotSame(prev, c, "重连应该是新连接")
                     // login 已经回了这条连接的 convs。
                     for (f in c!!.frames("convs")) answered.add(f["id"]!!.str)
@@ -177,7 +206,9 @@ class ChatSyncVectorsTest : SdkTest() {
                     null
                 }
                 "event" -> {
-                    c!!.receive(obj("cmd" to "event", "data" to st["event"]!!))
+                    val ev = obj("cmd" to "event", "data" to st["event"]!!)
+                    assertEquals(emptyList(), FrameSchema.errors(ev.toString()), ev.toString())
+                    c!!.receive(ev)
                     fetches = answerConvs(st)
                     drain { emptyList<JsonObject>() }
                 }
@@ -206,7 +237,13 @@ class ChatSyncVectorsTest : SdkTest() {
 
     private fun tcOf(acs: List<String>): String {
         val c4 = acs.any { it.startsWith("AC-QUO-") || it.startsWith("AC-MEN-") || it == "AC-RCL-03-13" }
-        return (listOf(if (c4) "TC-CHAT-90-33" else "TC-CHAT-90-13") + acs.map { tcOfAc[it] ?: it }).joinToString(" ")
+        val c5 = acs.any { it.startsWith("AC-CVS-") }
+        val tc = when {
+            c5 -> "TC-CHAT-90-39"
+            c4 -> "TC-CHAT-90-33"
+            else -> "TC-CHAT-90-13"
+        }
+        return (listOf(tc) + acs.map { tcOfAc[it] ?: it }).joinToString(" ")
     }
 
     @Test
@@ -222,12 +259,24 @@ class ChatSyncVectorsTest : SdkTest() {
         val cases = spec["cases"]!!.jsonArray.map { it.jsonObject }
         val acs = cases.flatMap { c -> c["acs"]!!.jsonArray.map { it.str } }
         for (ac in listOf("AC-RCL-03-13", "AC-QUO-02-2", "AC-QUO-02-6", "AC-MEN-03-7")) assertTrue(ac in acs, ac)
-        assertEquals(4, cases.count { c -> c["steps"]!!.jsonArray.any { it.jsonObject["op"]!!.str in setOf("event", "advance") } })
-        assertEquals(13, cases.size) // C2 7 个 + C4 6 个
+        val beforeC5 = cases.filter { c -> c["acs"]!!.jsonArray.none { it.str.startsWith("AC-CVS-") } }
+        assertEquals(4, beforeC5.count { c -> c["steps"]!!.jsonArray.any { it.jsonObject["op"]!!.str in setOf("event", "advance") } })
+        assertEquals(19, cases.size) // C2 7 个 + C4 6 个 + C5 6 个
         assertEquals(setOf("connect", "disconnect", "load", "event", "advance"), cases.flatMap { c -> c["steps"]!!.jsonArray.map { it.jsonObject["op"]!!.str } }.toSet())
     }
 
-    private val marks = listOf("ZXQ-FILE-NAME", "ZXQ-RCL-2", "ZXQ-QUO-1")
+    @Test
+    fun `TC-CHAT-90-39 C5 的用例都在（BE-487）：置顶排序、deleted 判断、两条清除路径、总未读，用到 convSettingsChanged、convDeleted`() {
+        val cases = spec["cases"]!!.jsonArray.map { it.jsonObject }
+        val c5 = cases.filter { c -> c["acs"]!!.jsonArray.any { it.str.startsWith("AC-CVS-") } }
+        assertEquals(6, c5.size)
+        val acs = c5.flatMap { c -> c["acs"]!!.jsonArray.map { it.str } }.toSet()
+        for (ac in listOf("AC-CVS-01-1", "AC-CVS-02-5", "AC-CVS-03-5", "AC-CVS-03-10", "AC-CVS-04-1", "AC-CVS-04-5")) assertTrue(ac in acs, ac)
+        val events = c5.flatMap { c -> c["steps"]!!.jsonArray.mapNotNull { (it.jsonObject["event"] as? JsonObject)?.get("type")?.str } }.toSet()
+        assertEquals(setOf("convSettingsChanged", "convDeleted"), events)
+    }
+
+    private val marks = listOf("ZXQ-FILE-NAME", "ZXQ-RCL-2", "ZXQ-QUO-1", "ZXQ-CVS-1")
 
     private fun run(c: JsonObject, dir: File?) {
         val h = setup(timings = IMClientTimings(heartbeatMs = 10 * 365 * 24 * 3_600_000L), database = dir?.let { tempDb(it) })
@@ -246,6 +295,13 @@ class ChatSyncVectorsTest : SdkTest() {
                 assertEquals(want.jsonArray.map { normalize(it.jsonObject) }, h.im.messages(convId).map { view(it) }, "$at $convId")
             }
             e["convsFetches"]?.let { assertEquals(it.jsonPrimitive.int, r.fetches, "$at convsFetches") }
+            // C5（TC-CHAT-90-39）：会话列表的顺序、各会话的状态、推断为被移出的群、总未读。
+            e["conversations"]?.let { want -> assertEquals(want.jsonArray.map { it.str }, h.im.conversations.value.map { it.convId }, "$at conversations") }
+            (e["convState"] as? JsonObject)?.let { want ->
+                assertEquals(want, JsonObject(h.im.conversations.value.associate { it.convId to convState(it) }), "$at convState")
+            }
+            e["removed"]?.let { want -> assertEquals(want.jsonArray.map { it.str }, h.call { debugExport() }.removed.sorted(), "$at removed") }
+            e["totalUnread"]?.let { assertEquals(it.jsonPrimitive.long, h.im.totalUnread.value, "$at totalUnread") }
             (e["mentionUnread"] as? JsonObject)?.let { want ->
                 val got = h.im.conversations.value.filter { it.mentionUnread != null }.associate { it.convId to it.mentionUnread!! }
                 assertEquals(want.mapValues { it.value.jsonPrimitive.long }, got, "$at mentionUnread")

@@ -1931,7 +1931,7 @@ public class IMClient(private val o: IMClientOptions) {
             "convAdded" -> {
                 val conv = ImJson.decodeFromJsonElement(ServerConversation.serializer(), ev["conv"] ?: return)
                 markPurges(mapOf(conv.convId to conv.minSeq))
-                if (store.upsertConversation(conv, rejoin = true)) emitMessages(conv.convId)
+                if (store.upsertConversation(conv)) emitMessages(conv.convId)
                 setGroupMute(conv.convId, conv.mutedUntil, conv.allMuted)
                 mutesChanged()
                 emitConversations()

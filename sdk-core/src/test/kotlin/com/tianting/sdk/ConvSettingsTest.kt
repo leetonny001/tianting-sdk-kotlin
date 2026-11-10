@@ -140,6 +140,12 @@ class ConvSettingsTest : SdkTest() {
     }
 
     @Test
+    fun `置顶时间相同：再按 updatedAt 倒序、convId 升序（同 Go 参考实现 chatmodel-Conversations）`() {
+        val (h, _) = online(sc(G1, updatedAt = 1, pinnedAt = 5), sc(G2, updatedAt = 9, pinnedAt = 5), sc("group:g3", updatedAt = 9, pinnedAt = 5), sc(AB, updatedAt = 99))
+        assertEquals(listOf(G2, "group:g3", G1, AB), h.ids())
+    }
+
+    @Test
     fun `已置顶的再置顶：本地 pinnedAt 不变（服务端同样不变，AC-CVS-01-2）`() {
         val (h, c) = online(sc(G1, pinnedAt = 55))
         h.clock.advance(10_000)
@@ -541,6 +547,81 @@ class ConvSettingsTest : SdkTest() {
         assertEquals(0L, h.im.totalUnread.value)
     }
 
+    // ---- 问题 65：服务端的 minSeq 变小时放低本地下限（F-CVS-03 规则 6a） ----
+
+    @Test
+    fun `问题 65：删除后离线期间被移出又加回（本地没有快照）：重连 convs 的 minSeq 变小，旧历史可以再加载`() {
+        val (h, c) = online(sc(G1, maxSeq = 5, readSeq = 5, updatedAt = 5))
+        h.loaded(c, G1, (1L..5L).map { m(G1, it) })
+        downEvent(c, "convDeleted", "convId" to G1, "clearedSeq" to 5)
+        down(c, msgFrame(m(G1, 6)))
+        assertEquals(6L, h.find(G1)!!.minSeq)
+        assertNull(h.call { conversationSnapshot(G1) })
+        // 离线期间被移出又加回（historyVisible=true）：没有收到 convRemoved，本地没有快照。
+        val n = reconnect(h, c, obj("convs" to listOf(sc(G1, maxSeq = 6, readSeq = 6, minSeq = 1, updatedAt = 6)), "truncated" to false))
+        val d = h.start { loadHistory(G1) }
+        assertEquals(6L, n.last("sync").dataObj["beforeSeq"]!!.str.toLong())
+        n.ack("sync", obj("messages" to (1L..5L).map { m(G1, it) }, "hasMore" to false))
+        h.await(d)
+        assertEquals((1L..6L).toList(), h.im.messages(G1).map { it.seq })
+    }
+
+    @Test
+    fun `问题 65：convAdded 的 minSeq 比本地下限小时放低、可以再加载；比本地大时按它清除本地消息（文件经 FilesExpired）`() {
+        val (h, c) = online(sc(G1, maxSeq = 5, readSeq = 5, updatedAt = 5))
+        val pic = JsonObject(m(G1, 2, body = obj("image" to obj("fileId" to "F2", "width" to 1, "height" to 1, "size" to 1, "mime" to "image/png"))) + mapOf("type" to JsonPrimitive("image")))
+        h.loaded(c, G1, listOf(m(G1, 1, text = CVS_SECRET), pic) + (3L..5L).map { m(G1, it) })
+        downEvent(c, "convAdded", "conv" to sc(G1, maxSeq = 5, readSeq = 5, minSeq = 4, updatedAt = 5))
+        assertEquals(listOf(4L, 5L), h.im.messages(G1).map { it.seq })
+        assertEquals(listOf(listOf("F2")), h.events.filterIsInstance<IMEvent.FilesExpired>().map { it.fileIds })
+        clean(h, CVS_SECRET)
+        downEvent(c, "convAdded", "conv" to sc(G1, maxSeq = 5, readSeq = 5, minSeq = 1, updatedAt = 5))
+        val d = h.start { loadHistory(G1) }
+        c.ack("sync", obj("messages" to listOf(m(G1, 3)), "hasMore" to false))
+        h.await(d)
+        assertEquals(listOf(3L, 4L, 5L), h.im.messages(G1).map { it.seq })
+    }
+
+    // ---- 问题 68：本机待发的消息，迟到的 ack 带回的 seq 落在清除范围里 ----
+
+    @Test
+    fun `问题 68：发送中的消息 ack 晚到、seq 落在清除范围里（upToSeq 之前已看到别人更新的消息）：这条一起去掉，不停在发送中`() {
+        val (h, c) = online(sc(AB, maxSeq = 2, readSeq = 2, updatedAt = 2))
+        h.loaded(c, AB, listOf(m(AB, 1), m(AB, 2)))
+        h.call { send(AB, "我的 $CVS_SECRET") } // 服务端给了 seq 3，ack 还没到
+        down(c, msgFrame(m(AB, 4))) // 别人更新的消息先到
+        val d = h.start { deleteConv(AB) }
+        assertEquals(4L, c.last("convDelete").dataObj["upToSeq"]!!.str.toLong())
+        down(c, ackOf(c, "convDelete", obj("clearedSeq" to 4)))
+        h.await(d)
+        assertEquals(listOf("cid-0001:sending"), h.status(AB)) // 发送中的不丢（问题 59）
+        down(c, ackOf(c, "send", obj("msgId" to "ab-3", "convId" to AB, "seq" to 3, "ts" to 9000)))
+        assertEquals(emptyList(), h.status(AB))
+        assertEquals(0, h.im.pendingCount.value)
+        assertEquals(emptyList(), h.ids())
+        clean(h, CVS_SECRET)
+    }
+
+    @Test
+    fun `问题 68：超时后已标记失败的，晚到的 ack 落在清除范围里同样去掉；别人用同一个 clientMsgId 的消息不算`() {
+        val (h, c) = online(sc(AB, maxSeq = 2, readSeq = 2, updatedAt = 2))
+        h.loaded(c, AB, listOf(m(AB, 1), m(AB, 2)))
+        h.call { send(AB, "我的") }
+        val sendId = c.last("send")["id"]!!.str
+        h.clock.advance(11_000)
+        assertEquals(listOf("bob-$AB-1:sent#1", "bob-$AB-2:sent#2", "cid-0001:failed(timeout)"), h.status(AB))
+        down(c, msgFrame(m(AB, 4)))
+        downEvent(c, "convDeleted", "convId" to AB, "clearedSeq" to 4) // 其他设备删除：失败的不丢（问题 63）
+        assertEquals(listOf("cid-0001:failed(timeout)"), h.status(AB))
+        // 别人的消息碰巧用了同一个 clientMsgId，seq 落在清除范围里：不动我的。
+        val other = JsonObject(m(AB, 3) + mapOf("clientMsgId" to JsonPrimitive("cid-0001")))
+        down(c, msgFrame(other))
+        assertEquals(listOf("alice"), h.call { debugExport() }.messages[AB]!!.filter { it.clientMsgId == "cid-0001" }.map { it.from })
+        down(c, obj("id" to sendId, "cmd" to "ack", "data" to obj("msgId" to "ab-3", "convId" to AB, "seq" to 3, "ts" to 9000)))
+        assertEquals(emptyList(), h.status(AB))
+        assertEquals(0, h.im.pendingCount.value)
+    }
+
     @Test
     fun `convSettingsChanged、convDeleted 缺字段或 clearedSeq 为负：忽略，不改本地`() {
         val (h, c) = online(sc(G1, maxSeq = 2, updatedAt = 1))
@@ -589,5 +670,37 @@ class ConvDeleteUploadsTest : AccountTest() {
         assertEquals(listOf(other.message.clientMsgId), a.im.messages(ac).map { it.clientMsgId })
         assertFalse(holds(storeOf(a.im), "ZXQ-CVS-2"))
         assertEquals(emptyList(), a.h.attachmentDir.listFiles()?.toList() ?: emptyList()) // 沙盒副本删除
+    }
+
+    @Test
+    fun `问题 68（附件）：图片已发出、ack 晚到且 seq 落在清除范围里：消息去掉，fileId 经 FilesExpired 通知页面，沙盒副本删除`() {
+        val ab = "c2c:$USER:bob"
+        val a = setupAccount()
+        a.session(1, DAY)
+        val c = a.online()
+        val img = ProcessedImage(
+            LocalFile(File(tmp, "o").apply { writeBytes(ByteArray(1000)) }, "image/jpeg"),
+            LocalFile(File(tmp, "t").apply { writeBytes(ByteArray(100)) }, "image/jpeg"),
+            10,
+            10,
+        )
+        a.h.call { sendImage(ab, img) }
+        val put = obj("url" to "https://s3.test/x?X-Amz-Signature=1", "headers" to obj(), "expiresAt" to 1)
+        a.http.last("/v1/files/uploads").respond(200, obj("fileId" to "F7", "put" to put, "thumbPut" to put))
+        a.h.objects.pending[0].respond(200)
+        a.h.objects.pending[0].respond(200)
+        a.http.last("/v1/files/F7/complete").respond(200, obj("fileId" to "F7", "size" to 1000, "mime" to "image/jpeg", "width" to 10, "height" to 10))
+        val sendId = c.last("send")["id"]!!.str
+        assertEquals(listOf(MessageStatus.SENDING), a.im.messages(ab).map { it.status })
+        c.receive(msgFrame(m(ab, 2)))
+        val d = a.h.start { deleteConv(ab) }
+        c.ack("convDelete", obj("clearedSeq" to 2))
+        a.h.await(d)
+        c.receive(obj("id" to sendId, "cmd" to "ack", "data" to obj("msgId" to "ab-1", "convId" to ab, "seq" to 1, "ts" to 9000)))
+        assertEquals(emptyList(), a.im.messages(ab))
+        assertTrue(a.h.events.filterIsInstance<IMEvent.FilesExpired>().any { "F7" in it.fileIds })
+        assertEquals(0, a.im.pendingCount.value)
+        a.h.flush()
+        assertEquals(emptyList(), a.h.attachmentDir.listFiles()?.toList() ?: emptyList())
     }
 }

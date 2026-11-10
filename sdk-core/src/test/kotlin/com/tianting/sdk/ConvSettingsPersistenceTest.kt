@@ -196,6 +196,25 @@ class ConvSettingsPersistenceTest : SdkTest() {
         JdbcLocalDatabase(File(dbDir, "im.db")).use { db -> assertEquals(0, db.query("SELECT * FROM pending_purges").size) }
     }
 
+    @Test
+    fun `问题 68 + 本地库：发送中的消息 ack 落在清除范围里，本地库里的这一行也删掉，冷启动不会以失败的样子回来`() {
+        val h = open()
+        val c = login(h, sc(AB, maxSeq = 2, readSeq = 2, updatedAt = 2))
+        h.loaded(c, AB, listOf(m(AB, 1), m(AB, 2)))
+        h.call { send(AB, "我的 $SECRET") }
+        present(SECRET)
+        down(c, msgFrame(m(AB, 4)))
+        downEvent(c, "convDeleted", "convId" to AB, "clearedSeq" to 4)
+        present(SECRET) // 发送中的还在（对照）
+        down(c, ackOf(c, "send", obj("msgId" to "ab-3", "convId" to AB, "seq" to 3, "ts" to 9000)))
+        assertEquals(emptyList(), h.im.messages(AB))
+        clean(SECRET)
+        h.closeDb()
+        clean(SECRET)
+        JdbcLocalDatabase(File(dbDir, "im.db")).use { db -> assertEquals(0, db.query("SELECT * FROM messages WHERE conv_id = ?", listOf(AB)).size) }
+        assertEquals(emptyList(), open().im.messages(AB))
+    }
+
     private fun cachedName(fileId: String): String {
         val h = java.security.MessageDigest.getInstance("SHA-256").digest(fileId.toByteArray()).joinToString("") { "%02x".format(it) }
         return "f-${h.take(40)}-original"

@@ -188,12 +188,15 @@ internal object NoStoreSink : StoreSink {
 
 private const val SUMMARY_LEN = 100
 
-/** F-CVS-01 规则 3：置顶在前按 pinnedAt 倒序，其余 updatedAt 倒序，同时间 convId 升序（同 sdk-ts 的 compareConvs）。 */
+/**
+ * F-CVS-01 规则 3：置顶在前按 pinnedAt 倒序，其余 updatedAt 倒序，同时间 convId 升序。置顶时间相同时再按 updatedAt 倒序、
+ * convId 升序（和 Go 参考实现 server/e2e/chatmodel/convs.go 的 Conversations、sdk-ts 的 compareConvs 一致）。
+ */
 private val CONV_ORDER: Comparator<Conversation> = Comparator { a, b ->
     when {
         a.pinned != b.pinned -> if (a.pinned) -1 else 1
         a.pinned && (a.pinnedAt ?: 0) != (b.pinnedAt ?: 0) -> (b.pinnedAt ?: 0).compareTo(a.pinnedAt ?: 0)
-        !a.pinned && a.updatedAt != b.updatedAt -> b.updatedAt.compareTo(a.updatedAt)
+        a.updatedAt != b.updatedAt -> b.updatedAt.compareTo(a.updatedAt)
         else -> a.convId.compareTo(b.convId)
     }
 }
@@ -291,7 +294,12 @@ internal class MessageList(private val convId: String, private val self: () -> S
      * deleted=false 或 quote.state=NORMAL 时不回写。返回合并后的消息，没有变化时为 null。
      */
     fun addServer(m: ServerMessage): Message? {
-        if (m.seq < floor) return null
+        if (m.seq < floor) {
+            // 清除范围内的：不写进来。本机待发的那条（ack 晚到，seq 落在清除范围里：upToSeq 之前已经看到了别人更新的消息）
+            // 一起去掉，不能一直停在"发送中"（frontend-chat 第 68 条，同 sdk-swift@94fda7b、sdk-ts@a536459）。
+            dropUnsentBelow(m)
+            return null
+        }
         if (m.clientMsgId in removedClient && m.from == self()) return null
         val deleted = m.deleted || isDeleted(m.msgId, m.seq)
         val recall = recallOf(m) ?: recallOf(m.msgId, m.seq)
@@ -349,6 +357,19 @@ internal class MessageList(private val convId: String, private val self: () -> S
         if (oldestSeq == 0L || m.seq < oldestSeq) oldestSeq = m.seq
         if (deleted) sink.wipeMessage(msg) else sink.upsertMessage(msg)
         return msg
+    }
+
+    /**
+     * 服务端说这条本机待发的消息落在清除范围里：从列表和本地库去掉，文件经 newlyExpired 清缓存（FilesExpired）。
+     * clientMsgId 只在同一发送者内唯一：别人的同名消息不算。之后的应答由下限挡住。
+     */
+    private fun dropUnsentBelow(m: ServerMessage) {
+        val local = byClient[m.clientMsgId] ?: return
+        if (local.seq != null || local.from != m.from) return
+        unsent.remove(local)
+        byClient.remove(m.clientMsgId)
+        local.body.fileId?.takeIf { it.isNotEmpty() }?.let { newlyExpired.add(it) }
+        sink.deleteUnsent(convId, m.clientMsgId)
     }
 
     private fun markExpired(msgId: String, body: MsgBody) {
@@ -644,7 +665,9 @@ internal class Store(private val self: () -> String, private val sink: StoreSink
         val purged = ArrayList<String>()
         for ((id, c) in next) {
             val l = msgs[id] ?: continue
-            if (id in snapshots) l.lowerFloor(c.view.minSeq) // 重新入群按新成员算（规则 6a）
+            // 服务端的 minSeq 比本地下限小只有一种情况：重新入群按新成员算（规则 6a）。被移出、再加入可能都发生在离线期间，
+            // 本地没有快照也没有收到 convRemoved，所以不看快照，按服务端的值放低（frontend-chat 第 65 条）。
+            l.lowerFloor(c.view.minSeq)
             if (l.purgeBelow(c.view.minSeq)) purged.add(id)
         }
         for ((id, h) in nextHidden) if (msgs[id]?.purgeBelow(h.clearedSeq + 1) == true) purged.add(id)
@@ -674,16 +697,16 @@ internal class Store(private val self: () -> String, private val sink: StoreSink
     }
 
     /**
-     * 服务端下发的完整会话（convAdded、convSet 的 ack）。rejoin=true（convAdded）时服务端的 minSeq 可以比本地的小（重新入群）。
-     * 返回消息是否被物理清除过。
+     * 服务端下发的完整会话（convAdded、convSet 的 ack）：服务端的 minSeq 比本地下限小（重新入群，规则 6a）时放低下限，
+     * 旧历史可以重新加载（frontend-chat 第 65 条）；比本地下限大时按它物理清除。返回消息是否被物理清除过。
      */
-    fun upsertConversation(c: ServerConversation, rejoin: Boolean = false): Boolean {
+    fun upsertConversation(c: ServerConversation): Boolean {
         val state = fromServer(c)
         convs[c.convId] = state
         placeholders.remove(c.convId)
         if (hidden.remove(c.convId) != null) sink.unhideConversation(c.convId)
         val l = msgs[c.convId]
-        if (l != null && (rejoin || c.convId in snapshots)) l.lowerFloor(c.minSeq)
+        l?.lowerFloor(c.minSeq)
         val purged = l?.purgeBelow(c.minSeq) == true
         // 重新被拉进群：清除快照（G-UI-21 ③），内存里的消息重新写回本地库，否则下次冷启动中间会缺一段。
         if (snapshots.remove(c.convId) != null) msgs[c.convId]?.persistAll()

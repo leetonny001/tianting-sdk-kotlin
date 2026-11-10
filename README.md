@@ -184,10 +184,10 @@ IMEvent.ConvDeleted(convId)          // 本端删除成功或其他设备删除�
 
 | 规则 | 说明 |
 |---|---|
-| 排序 | 置顶的在前（`pinnedAt` 倒序），其余 `updatedAt` 倒序，同时间按 `convId`；`Conversation.pinned`、`pinnedAt`、`notifyOff` |
+| 排序 | 置顶的在前（`pinnedAt` 倒序，相同再按 `updatedAt` 倒序、`convId`，同 Go 参考实现），其余 `updatedAt` 倒序，同时间按 `convId`；`Conversation.pinned`、`pinnedAt`、`notifyOff` |
 | 删除 | `minSeq = clearedSeq + 1`、已读推进到 `clearedSeq`、不再置顶、保留免打扰；本端删除时这个会话没发出的附件取消上传、排队和失败的消息丢弃；其他设备删除时不丢（问题 63）。之后有新消息，会话按删除时的状态重新出现，未读只算新消息 |
 | `convs` | `deleted` 里的群不是"你已不在该群"（没有 `ConvRemoved`、没有快照）；`truncated` 或 `deletedTruncated` 时不推断。每个会话按 `minSeq`（`deleted` 里的按 `clearedSeq + 1`）物理清除 |
-| 物理清除 | 内存、本地库的行、缓存目录的文件（`FilesExpired`）一起清；迟到的 sync、ack 不写回。保留下来的消息里的引用摘要照常显示，只有本端没发出、引用了被清除消息的清除原文（问题 62） |
+| 物理清除 | 内存、本地库的行、缓存目录的文件（`FilesExpired`）一起清；迟到的 sync、ack 不写回；本机待发的消息 ack 晚到、seq 落在清除范围里时这条一起去掉（问题 68）。服务端的 `minSeq`（`convs`、`convAdded`）比本地下限小时放低下限、旧历史可以再加载（重新入群，规则 6a，问题 65）。保留下来的消息里的引用摘要照常显示，只有本端没发出、引用了被清除消息的清除原文（问题 62） |
 | 本地库 | 第 4 版：`cleared_convs`（被删除隐藏的会话，没有摘要）、`pending_purges`（"待清除"：清除前单独提交，清除的事务里删掉；失败或进程中途结束时下次 `open()` 补清，连同缓存文件）。第 1～3 版原地升级。置顶、免打扰在会话的 json 列里，冷启动先显示，`convs` 回来以服务端为准 |
 
 ## 开发
