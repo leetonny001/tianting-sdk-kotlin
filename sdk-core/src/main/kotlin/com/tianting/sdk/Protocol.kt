@@ -229,7 +229,25 @@ internal data class ServerConversation(
     val mentionUnread: Long? = null,
     /** 未读里第一条提及我的 seq；mentionUnread=0 时没有。 */
     val firstMentionSeq: Long? = null,
+    /** 置顶（PRD-chat F-CVS-01，C5）：没有置顶时服务端不带；老服务端没有，按 false。 */
+    val pinned: Boolean = false,
+    /** 置顶时间，只在 pinned=true 时有；置顶的会话按它倒序排在最前（F-CVS-01 规则 3）。 */
+    val pinnedAt: Long? = null,
+    /** 免打扰（F-CVS-02，C5）：不推送、未读照常计算。不叫 muted（那是禁言，R-CB-26）。老服务端没有，按 false。 */
+    val notifyOff: Boolean = false,
 )
+
+/** convs 的 deleted 一项（F-CVS-03 规则 6，C5）：被我删除、之后没有新消息的会话。 */
+@Serializable
+internal data class DeletedConv(val convId: String, val clearedSeq: Long)
+
+/** convSet 的 ack（C5）：完整的新会话。 */
+@Serializable
+internal data class ConvSetAck(val conv: ServerConversation)
+
+/** convDelete 的 ack（C5）：min(upToSeq, maxSeq)，不小于原有值。 */
+@Serializable
+internal data class ConvDeleteAck(val clearedSeq: Long)
 
 @Serializable
 internal data class SendAck(val msgId: String, val convId: String, val seq: Long, val ts: Long)
@@ -238,7 +256,14 @@ internal data class SendAck(val msgId: String, val convId: String, val seq: Long
 internal data class SyncAck(val messages: List<ServerMessage> = emptyList(), val hasMore: Boolean = false)
 
 @Serializable
-internal data class ConvsAck(val convs: List<ServerConversation> = emptyList(), val truncated: Boolean = false)
+internal data class ConvsAck(
+    val convs: List<ServerConversation> = emptyList(),
+    val truncated: Boolean = false,
+    /** 当前被我删除、没有新消息的会话（C5）：消失的群先查它，在里面的不是"你已不在该群"。老服务端没有。 */
+    val deleted: List<DeletedConv> = emptyList(),
+    /** deleted 超过上限被截断（C5）：这时和 truncated 一样不推断"你已不在该群"（frontend-chat 第 54 条）。 */
+    val deletedTruncated: Boolean = false,
+)
 
 @Serializable
 internal data class AuthAck(

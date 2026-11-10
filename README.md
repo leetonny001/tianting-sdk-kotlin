@@ -165,10 +165,30 @@ im.searchGroupMembers(groupId, keyword)  // @ 选人；4290 不自动重试
 | 单调合并 | `deleted`、`recalled` 只能从假变真；`quote.state` 只能从 normal 往后走，`quote.text` 清除后不恢复；迟到的旧 sync、ack 带着原文也写不回来（F-RCL-03 规则 2a，`chat-sync.json`） |
 | 收到撤回 | `msgDeleted` 带 `recalled`：清除原文，本会话里引用它的消息（含待发的）的 `quote.text` 一起清掉、状态改 recalled（F-QUO-02 规则 4）；文件的地址和下载缓存清掉，发 `FilesExpired` |
 | 下载中被撤回 | 正在下载的文件所在消息被撤回或删除：中止下载、删掉部分文件，`download` 抛 `DownloadAbortedError`，发 `DownloadAborted(fileId, recalled)`；App 据此提示"该消息已被撤回"（AC-RCL-03-12） |
-| 本地库 | 第 3 版：`deleted_refs` 多一种 `kind='recalled'`（只知道 msgId、seq 的撤回，跨冷启动保留撤回者）。第 1、2 版原地升级，旧行保留；更新或不认识的版本按缓存重建。撤回、清引用后照样 `secure_delete` + checkpoint（不支持时 VACUUM），数据库文件里搜不到原文 |
+| 本地库 | 第 3 版（现在是第 4 版，见 C5）：`deleted_refs` 多一种 `kind='recalled'`（只知道 msgId、seq 的撤回，跨冷启动保留撤回者）。第 1、2 版原地升级，旧行保留；更新或不认识的版本按缓存重建。撤回、清引用后照样 `secure_delete` + checkpoint（不支持时 VACUUM），数据库文件里搜不到原文 |
 | 提及 | `Conversation.mentionUnread`、`firstMentionSeq`（服务端没给时为 null，不推算）。实时收到 @ 我 / @ 所有人（自己发的不算）本地 +1；本端读到最新清零；有提及的会话收到 `readUpdated`、`msgDeleted` 时节流 5 秒重拉 `convs` |
 | 失败 | 4040（`errorReason=quoteUnavailable`）、4293（"@所有人次数已用完"）、4131 标记失败，不自动重发。`IMError.reason` 是 ack 的 `error.reason` |
 | 日志 | 不打印引用文字、@ 的内容；`QuoteView.toString()` 不带 `text` |
+
+## 置顶、免打扰、删除会话（FE-681，C5）
+
+语义和 sdk-ts 相同（FE-680）。服务端开关 `IM_CONV_SETTINGS_ENABLED`；`AccountConfig.Features.convSettings` 关闭时页面只隐藏入口，SDK 照常应用已有的设置（P-46 ②）。
+
+```kotlin
+im.setConvPinned(convId, true)       // 乐观更新：先移到最前；ack 的 conv 覆盖本地；失败回滚并抛 IMError / TimeoutError / NotConnectedError，不自动重试
+im.setConvNotifyOff(convId, true)    // 同上（4220 置顶已满、4290、4030、5000 都回滚）
+im.deleteConv(convId)                // upToSeq = 本地看到的最大 seq；先从列表消失，失败恢复；确认框由页面弹
+im.totalUnread.value                 // 普通会话的 unread 之和 + 免打扰会话的 mentionUnread 之和
+IMEvent.ConvDeleted(convId)          // 本端删除成功或其他设备删除了它：页面清这个会话的草稿
+```
+
+| 规则 | 说明 |
+|---|---|
+| 排序 | 置顶的在前（`pinnedAt` 倒序），其余 `updatedAt` 倒序，同时间按 `convId`；`Conversation.pinned`、`pinnedAt`、`notifyOff` |
+| 删除 | `minSeq = clearedSeq + 1`、已读推进到 `clearedSeq`、不再置顶、保留免打扰；本端删除时这个会话没发出的附件取消上传、排队和失败的消息丢弃；其他设备删除时不丢（问题 63）。之后有新消息，会话按删除时的状态重新出现，未读只算新消息 |
+| `convs` | `deleted` 里的群不是"你已不在该群"（没有 `ConvRemoved`、没有快照）；`truncated` 或 `deletedTruncated` 时不推断。每个会话按 `minSeq`（`deleted` 里的按 `clearedSeq + 1`）物理清除 |
+| 物理清除 | 内存、本地库的行、缓存目录的文件（`FilesExpired`）一起清；迟到的 sync、ack 不写回。保留下来的消息里的引用摘要照常显示，只有本端没发出、引用了被清除消息的清除原文（问题 62） |
+| 本地库 | 第 4 版：`cleared_convs`（被删除隐藏的会话，没有摘要）、`pending_purges`（"待清除"：清除前单独提交，清除的事务里删掉；失败或进程中途结束时下次 `open()` 补清，连同缓存文件）。第 1～3 版原地升级。置顶、免打扰在会话的 json 列里，冷启动先显示，`convs` 回来以服务端为准 |
 
 ## 开发
 
@@ -199,6 +219,8 @@ scripts/sync-protocol.sh       # 默认从同级目录 ../tianting-server（或 
 ./gradlew :sdk-core:integrationTest   # 含 PushIntegrationTest（IM_PUSH_ENABLED=1，另起一个关闭开关的服务端验 4001）。默认找同级目录 ../tianting-server/server 或 ../im-mvp/server
 TIANTING_SERVER_DIR=/path/to/tianting-server/server ./gradlew :sdk-core:integrationTest
 ```
+
+`ConvSettingsIntegrationTest`（C5）用 `IM_CONV_SETTINGS_ENABLED=1`；服务端命令（BE-483～486）完成之前 `convSet`、`convDelete` 回 4001，这些用例如实失败，不跳过。
 
 CI 里的集成测试需要读取私有仓库 tianting-server：配置只读部署密钥和 Actions secret `TIANTING_SERVER_DEPLOY_KEY`。没配置时 CI 跳过集成测试，只跑单元测试。
 

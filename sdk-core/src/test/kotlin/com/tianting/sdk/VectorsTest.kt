@@ -17,6 +17,7 @@ import org.junit.jupiter.api.TestFactory
 import java.io.File
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -128,6 +129,8 @@ class VectorsTest : SdkTest() {
             f["cmd"]!!.str != "ack" || data == null -> null
             "serverTime" in data -> { d -> ImJson.decodeFromJsonElement(AuthAck.serializer(), d) }
             "convs" in data -> { d -> ImJson.decodeFromJsonElement(ConvsAck.serializer(), d) }
+            "conv" in data -> { d -> ImJson.decodeFromJsonElement(ConvSetAck.serializer(), d) } // C5
+            "clearedSeq" in data -> { d -> ImJson.decodeFromJsonElement(ConvDeleteAck.serializer(), d) } // C5
             "seq" in data -> { d -> ImJson.decodeFromJsonElement(SendAck.serializer(), d) }
             "hasMore" in data && "messages" in data -> { d -> ImJson.decodeFromJsonElement(SyncAck.serializer(), d) }
             "user" in data -> { d -> ImJson.decodeFromJsonElement(SearchAck.serializer(), d) }
@@ -148,6 +151,17 @@ class VectorsTest : SdkTest() {
         for (f in down) c.receive(f)
         assertEquals(ConnState.CONNECTED, h.im.state.value)
         assertEquals(emptyList(), h.logs.filter { it.contains("unexpected") })
+    }
+
+    @Test
+    fun `frames json：C5 的 convs（pinned、notifyOff、deleted）解码出的值和帧一致（AC-CHAT-90-10）`() {
+        val f = frames["valid"]!!.jsonArray.map { it.jsonObject }.single { it["name"]!!.str == "ack convs 带 pinned、notifyOff、deleted（C5）" }
+        val ack = ImJson.decodeFromJsonElement(ConvsAck.serializer(), f["frame"]!!.jsonObject["data"]!!)
+        assertEquals(listOf(Triple(true, 1730000100000L, true), Triple(true, 1730000099000L, false), Triple(false, null, true), Triple(false, null, false)), ack.convs.map { Triple(it.pinned, it.pinnedAt, it.notifyOff) })
+        assertEquals(listOf(DeletedConv("group:g5", 12), DeletedConv("c2c:u1:u9", 3)), ack.deleted)
+        assertFalse(ack.deletedTruncated)
+        val t = frames["valid"]!!.jsonArray.map { it.jsonObject }.single { it["name"]!!.str == "ack convs deletedTruncated（C5）" }
+        assertTrue(ImJson.decodeFromJsonElement(ConvsAck.serializer(), t["frame"]!!.jsonObject["data"]!!).deletedTruncated)
     }
 
     @Test

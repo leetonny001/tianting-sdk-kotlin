@@ -311,7 +311,7 @@ class MsgActionsPersistenceTest : SdkTest() {
     }
 
     @Test
-    fun `本地库第 2 版原地升级到第 3 版：会话、消息（含失败、已删除）、deleted_refs 旧行、modVer 基线都保留，旧行没有 C4 字段按默认值`() {
+    fun `本地库第 2 版原地升级（经第 3 版到第 4 版）：会话、消息（含失败、已删除）、deleted_refs 旧行、modVer 基线都保留，旧行没有 C4 字段按默认值`() {
         val file = File(dbDir, "im.db")
         createV2(file)
         val h = setup(database = JdbcLocalDatabase(file), filesRoot = files)
@@ -329,7 +329,7 @@ class MsgActionsPersistenceTest : SdkTest() {
         c.receive(recalledEvent(G, 1, "bob"))
         h.closeDb()
         JdbcLocalDatabase(file).use { db ->
-            assertEquals(3L, db.query("PRAGMA user_version").single().values.single())
+            assertEquals(4L, db.query("PRAGMA user_version").single().values.single())
             assertEquals(setOf("id", "seq", "client", "recalled"), db.query("SELECT DISTINCT kind FROM deleted_refs").map { it["kind"] }.toSet())
             assertEquals(4L, db.query("SELECT mod_ver FROM mod_vers").single()["mod_ver"])
         }
@@ -340,13 +340,13 @@ class MsgActionsPersistenceTest : SdkTest() {
     }
 
     @Test
-    fun `本地库版本比第 3 版新（或未知）：按缓存重建，不报错`() {
+    fun `本地库版本比当前（第 4 版）新（或未知）：按缓存重建，不报错`() {
         val file = File(dbDir, "im.db")
-        createV2(file, version = 4)
+        createV2(file, version = 5)
         val h = setup(database = JdbcLocalDatabase(file), filesRoot = files)
         assertEquals(emptyList(), h.im.conversations.value)
         h.closeDb()
-        JdbcLocalDatabase(file).use { db -> assertEquals(3L, db.query("PRAGMA user_version").single().values.single()) }
+        JdbcLocalDatabase(file).use { db -> assertEquals(4L, db.query("PRAGMA user_version").single().values.single()) }
     }
 }
 

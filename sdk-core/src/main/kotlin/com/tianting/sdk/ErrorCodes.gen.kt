@@ -52,6 +52,7 @@ public object ErrorCode {
     public const val STRANGER_MSG_LIMIT: Int = 4137
     public const val FILE_TOO_LARGE: Int = 4139
     public const val FILE_TYPE_NOT_ALLOWED: Int = 4150
+    public const val PIN_LIMIT_EXCEEDED: Int = 4220
     public const val RATE_LIMITED: Int = 4290
     public const val QUOTA_EXCEEDED: Int = 4292
     public const val MENTION_ALL_LIMITED: Int = 4293
@@ -112,6 +113,7 @@ internal val ERROR_INFO: Map<Int, ErrorInfo> = mapOf(
     4137 to ErrorInfo("STRANGER_MSG_LIMIT", false, "对方回复前的条数已用完"),
     4139 to ErrorInfo("FILE_TOO_LARGE", false, "超过大小限制（details.maxBytes）"),
     4150 to ErrorInfo("FILE_TYPE_NOT_ALLOWED", false, "禁止的类型或内容与声明不符"),
+    4220 to ErrorInfo("PIN_LIMIT_EXCEEDED", false, "置顶数量已满"),
     4290 to ErrorInfo("RATE_LIMITED", true, "操作过于频繁"),
     4292 to ErrorInfo("QUOTA_EXCEEDED", false, "今天的次数已用完"),
     4293 to ErrorInfo("MENTION_ALL_LIMITED", false, "@ 所有人次数用完（details.retryAfterSeconds）"),

@@ -1790,6 +1790,24 @@ class AccountSessionTest : AccountTest() {
     }
 
     @Test
+    fun `backend-chat 第 75 条：features 解析出 convSettings；老服务端没有这个字段按关闭（P-46 ② 关闭时 SDK 照常应用已有设置）`() {
+        for ((features, want) in listOf(
+            obj("files" to true, "convSettings" to true) to true,
+            obj("files" to true, "convSettings" to false) to false,
+            obj("files" to true) to false,
+        )) {
+            val a = setupAccount()
+            val p = a.start { getConfig() }
+            val limits = obj(
+                "usernameMinLen" to 4, "usernameMaxLen" to 32, "passwordMinLen" to 8,
+                "passwordMaxLen" to 128, "nicknameMaxLen" to 32, "deviceNameMaxLen" to 64,
+            )
+            a.http.last("/v1/config").respond(200, obj("registerMode" to "open", "demoLogin" to false, "features" to features, "limits" to limits))
+            assertEquals(want, a.await(p).features.convSettings, features.toString())
+        }
+    }
+
+    @Test
     fun `第 13-1 节 响应形状不对按网络错误，不把内容带进异常`() {
         val a = setupAccount()
         val p = a.start { getConfig() }

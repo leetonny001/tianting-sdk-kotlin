@@ -1,5 +1,7 @@
 package com.tianting.sdk
 
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.serializer
 import java.io.Closeable
 
 /**
@@ -17,7 +19,7 @@ public interface LocalDatabase : Closeable {
     public fun <T> transaction(block: () -> T): T
 }
 
-private const val SCHEMA_VERSION = 3L
+private const val SCHEMA_VERSION = 4L
 
 /** 冷启动时每个会话最多恢复多少条消息，更早的从库里删掉，靠向上翻页。 */
 internal const val RESTORE_LIMIT_PER_CONV = 200
@@ -56,7 +58,14 @@ internal class RestoredState(
     val attachments: List<AttachmentRecord> = emptyList(),
     /** 最近一次重拉时各会话的 modVer（F-RCL-03 规则 2）。 */
     val modVers: Map<String, Long> = emptyMap(),
+    /** 被我删除、没有新消息的会话（第 4 版，C5）。 */
+    val hidden: List<HiddenRecord> = emptyList(),
+    /** 上次没清完、这次启动补清的消息里的 fileId：调用方删掉对应的缓存文件（F-CVS-03 异常）。 */
+    val purgedFiles: List<String> = emptyList(),
 )
+
+/** cleared_convs 的一行：view 为 null 表示只从 convs 的 deleted 知道。 */
+internal class HiddenRecord(val convId: String, val clearedSeq: Long, val view: Conversation?, val readBase: Long)
 
 /** 一条附件消息的沙盒副本（文件在 attachmentDir 里，按 clientMsgId 定位）。name 是文件名，和消息正文一样只在本地库。 */
 @kotlinx.serialization.Serializable
@@ -100,14 +109,17 @@ internal class LocalDb(private val db: LocalDatabase, private val log: Logger) :
         secureDeleteOk = (db.query("PRAGMA secure_delete=ON").firstOrNull()?.values?.firstOrNull() as? Long) == 1L
         db.query("PRAGMA journal_mode=DELETE")
         val version = db.query("PRAGMA user_version").firstOrNull()?.values?.firstOrNull() as? Long ?: 0L
-        if (version == 1L || version == 2L) {
+        if (version in 1L until SCHEMA_VERSION) {
             // 原地升级，原有的会话、消息（含待发、失败）、社交数据、deleted_refs 的旧行都保留：
             // 第 1 版 → 第 2 版（FE-631，C2）：加附件沙盒和 modVer 两张表。新的发送状态和 image、file 都在 json 列里，旧行照常解码。
             // 第 2 版 → 第 3 版（FE-661，C4）：deleted_refs 多一种 kind='recalled'；消息的 recalled、quote、mentions 和会话的
             // mentionUnread、firstMentionSeq 都在 json 列里（旧行没有这些字段，按默认值解码），不改表结构。
             // 版本号照样加 1：老版本 SDK 打开第 3 版的库会按"版本不同"重建，不会把撤回的记录当成不认识的行留着。
+            // 第 3 版 → 第 4 版（FE-681，C5）：加被删除隐藏的会话（cleared_convs）和"待清除"标记（pending_purges）两张表；
+            // 会话的 pinned、pinnedAt、notifyOff 在 json 列里（旧行没有，按 false 解码）。
             db.transaction {
                 if (version == 1L) createV2Tables()
+                createV4Tables()
                 db.execute("PRAGMA user_version = $SCHEMA_VERSION")
             }
         } else if (version != SCHEMA_VERSION) {
@@ -116,6 +128,7 @@ internal class LocalDb(private val db: LocalDatabase, private val log: Logger) :
             createTables()
             db.execute("PRAGMA user_version = $SCHEMA_VERSION")
         }
+        applyPendingPurges()
     }
 
     private fun createTables() = db.transaction {
@@ -128,11 +141,22 @@ internal class LocalDb(private val db: LocalDatabase, private val log: Logger) :
         db.execute("CREATE TABLE friend_requests(user_id TEXT NOT NULL, direction TEXT NOT NULL, ver INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY(user_id, direction))")
         db.execute("CREATE TABLE blocks(user_id TEXT PRIMARY KEY, ver INTEGER NOT NULL, json TEXT NOT NULL)")
         createV2Tables()
+        createV4Tables()
     }
 
     private fun createV2Tables() {
         db.execute("CREATE TABLE attachments(client_msg_id TEXT PRIMARY KEY, conv_id TEXT NOT NULL, json TEXT NOT NULL)")
         db.execute("CREATE TABLE mod_vers(conv_id TEXT PRIMARY KEY, mod_ver INTEGER NOT NULL)")
+    }
+
+    /**
+     * 第 4 版（C5）：cleared_convs 是被我删除、还没有新消息的会话（json 是删除后的会话，没有摘要；只从 deleted 知道的为 NULL）；
+     * pending_purges 是"待清除"（F-CVS-03 异常"本地清除失败：下次启动再清"）：清除前单独提交，和清除在同一事务里删掉。
+     * file_ids 是要清的消息里的 fileId（JSON 数组），补清时删缓存文件用；不放消息内容。
+     */
+    private fun createV4Tables() {
+        db.execute("CREATE TABLE cleared_convs(conv_id TEXT PRIMARY KEY, cleared_seq INTEGER NOT NULL, read_base INTEGER NOT NULL, json TEXT)")
+        db.execute("CREATE TABLE pending_purges(conv_id TEXT PRIMARY KEY, min_seq INTEGER NOT NULL, file_ids TEXT NOT NULL)")
     }
 
     /**
@@ -230,6 +254,8 @@ internal class LocalDb(private val db: LocalDatabase, private val log: Logger) :
                 db.execute("DELETE FROM conversations WHERE conv_id = ?", listOf(convId))
                 db.execute("DELETE FROM messages WHERE conv_id = ?", listOf(convId))
                 db.execute("DELETE FROM deleted_refs WHERE conv_id = ?", listOf(convId))
+                db.execute("DELETE FROM cleared_convs WHERE conv_id = ?", listOf(convId))
+                db.execute("DELETE FROM pending_purges WHERE conv_id = ?", listOf(convId))
                 markDirty()
             }
         }
@@ -293,6 +319,127 @@ internal class LocalDb(private val db: LocalDatabase, private val log: Logger) :
 
     override fun addExpiredRefs(convId: String, msgIds: Collection<String>) = guarded {
         for (id in msgIds) db.execute("INSERT OR IGNORE INTO deleted_refs(conv_id, kind, ref) VALUES(?, 'expired', ?)", listOf(convId, id))
+    }
+
+    // ---- 删除会话、物理清除（FE-681，C5） ----
+
+    override fun purgeBelow(convId: String, minSeq: Long) = guarded {
+        db.execute("DELETE FROM messages WHERE conv_id = ? AND seq < ?", listOf(convId, minSeq))
+        db.execute("DELETE FROM pending_purges WHERE conv_id = ? AND min_seq <= ?", listOf(convId, minSeq))
+        markDirty()
+    }
+
+    override fun hideConversation(convId: String, clearedSeq: Long, c: ConvState?) = guarded {
+        db.execute("DELETE FROM conversations WHERE conv_id = ?", listOf(convId))
+        writeHidden(convId, HiddenConv(clearedSeq, c))
+        markDirty() // 会话行里的摘要是原文
+    }
+
+    private fun writeHidden(convId: String, h: HiddenConv) {
+        db.execute(
+            "INSERT OR REPLACE INTO cleared_convs(conv_id, cleared_seq, read_base, json) VALUES(?, ?, ?, ?)",
+            listOf(convId, h.clearedSeq, h.conv?.readBase ?: 0L, h.conv?.let { ImJson.encodeToString(Conversation.serializer(), it.view) }),
+        )
+    }
+
+    override fun unhideConversation(convId: String) = guarded {
+        db.execute("DELETE FROM cleared_convs WHERE conv_id = ?", listOf(convId))
+    }
+
+    override fun replaceHidden(list: Map<String, HiddenConv>) = guarded {
+        transaction {
+            guarded {
+                db.execute("DELETE FROM cleared_convs")
+                for ((id, h) in list) writeHidden(id, h)
+            }
+        }
+    }
+
+    /**
+     * 清除之前先记"待清除"（会话 → 要清到的 minSeq，单独提交）：清除的事务失败或进程在中间结束时，下次启动 open() 补清
+     * （F-CVS-03 异常，FE-681 第 2 条）。只在最外层调用（不在别的事务里），已有的标记取较大的 minSeq。
+     */
+    fun markPurges(targets: Map<String, Long>) {
+        if (targets.isEmpty() || paused) return
+        try {
+            db.transaction {
+                for ((convId, min) in targets) {
+                    val old = db.query("SELECT min_seq, file_ids FROM pending_purges WHERE conv_id = ?", listOf(convId)).firstOrNull()
+                    val files = LinkedHashSet<String>()
+                    (old?.get("file_ids") as? String)?.let { files.addAll(decodeIds(it)) }
+                    files.addAll(fileIdsBelow(convId, min))
+                    db.execute(
+                        "INSERT OR REPLACE INTO pending_purges(conv_id, min_seq, file_ids) VALUES(?, ?, ?)",
+                        listOf(convId, maxOf(min, old?.get("min_seq") as Long? ?: 0L), ImJson.encodeToString(ID_LIST, files.toList())),
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            logFailure(e)
+        }
+    }
+
+    private fun fileIdsBelow(convId: String, min: Long): List<String> =
+        db.query("SELECT json FROM messages WHERE conv_id = ? AND seq < ?", listOf(convId, min)).mapNotNull {
+            runCatching { ImJson.decodeFromString(Message.serializer(), it["json"] as String) }.getOrNull()?.body?.fileId?.takeIf { id -> id.isNotEmpty() }
+        }
+
+    private fun decodeIds(s: String): List<String> = runCatching { ImJson.decodeFromString(ID_LIST, s) }.getOrDefault(emptyList())
+
+    /** 上次没清完的（pending_purges 里还有）：补清消息行、待发消息里引用它们的原文、会话摘要。补清的文件 ID 交给 load()。 */
+    private var purgedFiles: List<String> = emptyList()
+
+    private fun applyPendingPurges() {
+        val marks = db.query("SELECT conv_id, min_seq, file_ids FROM pending_purges")
+        if (marks.isEmpty()) return
+        val files = LinkedHashSet<String>()
+        db.transaction {
+            for (r in marks) {
+                val convId = r["conv_id"] as String
+                val min = r["min_seq"] as Long
+                files.addAll(decodeIds(r["file_ids"] as String))
+                val rows = db.query("SELECT row_key, seq, json FROM messages WHERE conv_id = ?", listOf(convId))
+                val gone = HashSet<String>()
+                val unsent = ArrayList<Pair<String, Message>>()
+                for (row in rows) {
+                    val m = runCatching { ImJson.decodeFromString(Message.serializer(), row["json"] as String) }.getOrNull() ?: continue
+                    val seq = row["seq"] as Long?
+                    if (seq == null) {
+                        unsent.add(row["row_key"] as String to m)
+                    } else if (seq < min) {
+                        m.msgId?.let { gone.add(it) }
+                        m.body.fileId?.takeIf { it.isNotEmpty() }?.let { files.add(it) }
+                    }
+                }
+                db.execute("DELETE FROM messages WHERE conv_id = ? AND seq < ?", listOf(convId, min))
+                for ((key, m) in unsent) {
+                    val q = m.body.quote ?: continue
+                    if (q.state != QuoteState.NORMAL || (q.msgId !in gone && !(q.seq != null && q.seq < min))) continue
+                    val fixed = m.copy(body = m.body.copy(quote = q.copy(state = QuoteState.DELETED, text = null)))
+                    db.execute(
+                        "UPDATE messages SET json = ? WHERE conv_id = ? AND row_key = ?",
+                        listOf(ImJson.encodeToString(Message.serializer(), fixed), convId, key),
+                    )
+                }
+                val c = db.query("SELECT read_base, json FROM conversations WHERE conv_id = ?", listOf(convId)).firstOrNull()
+                val view = c?.let { runCatching { ImJson.decodeFromString(Conversation.serializer(), it["json"] as String) }.getOrNull() }
+                if (c != null && view != null) {
+                    if (view.maxSeq < min) {
+                        // 全部清除了：会话按删除隐藏（摘要是原文，不能留在会话表里）。
+                        db.execute("DELETE FROM conversations WHERE conv_id = ?", listOf(convId))
+                        writeHidden(convId, HiddenConv(min - 1, ConvState(clearedView(view, min - 1), c["read_base"] as Long)))
+                    } else if (view.minSeq < min) {
+                        db.execute(
+                            "UPDATE conversations SET json = ? WHERE conv_id = ?",
+                            listOf(ImJson.encodeToString(Conversation.serializer(), view.copy(minSeq = min)), convId),
+                        )
+                    }
+                }
+                db.execute("DELETE FROM pending_purges WHERE conv_id = ?", listOf(convId))
+            }
+        }
+        flushDeleted()
+        purgedFiles = files.toList()
     }
 
     // ---- 附件和 modVer（FE-631） ----
@@ -425,6 +572,15 @@ internal class LocalDb(private val db: LocalDatabase, private val log: Logger) :
             blocks = db.query("SELECT json FROM blocks").map { ImJson.decodeFromString(BlockItem.serializer(), it["json"] as String) },
             attachments = db.query("SELECT json FROM attachments").map { ImJson.decodeFromString(AttachmentRecord.serializer(), it["json"] as String) },
             modVers = db.query("SELECT conv_id, mod_ver FROM mod_vers").associate { it["conv_id"] as String to it["mod_ver"] as Long },
+            hidden = db.query("SELECT conv_id, cleared_seq, read_base, json FROM cleared_convs").map {
+                HiddenRecord(
+                    it["conv_id"] as String,
+                    it["cleared_seq"] as Long,
+                    (it["json"] as String?)?.let { j -> ImJson.decodeFromString(Conversation.serializer(), j) },
+                    it["read_base"] as Long,
+                )
+            },
+            purgedFiles = purgedFiles.also { purgedFiles = emptyList() },
         )
     }
 
@@ -437,6 +593,10 @@ internal class LocalDb(private val db: LocalDatabase, private val log: Logger) :
     }
 
     private companion object {
-        val TABLES = listOf("meta", "conversations", "messages", "deleted_refs", "social_meta", "friends", "friend_requests", "blocks", "attachments", "mod_vers")
+        val TABLES = listOf(
+            "meta", "conversations", "messages", "deleted_refs", "social_meta", "friends", "friend_requests", "blocks", "attachments", "mod_vers",
+            "cleared_convs", "pending_purges",
+        )
+        val ID_LIST = ListSerializer(String.serializer())
     }
 }

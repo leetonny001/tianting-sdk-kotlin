@@ -111,7 +111,21 @@ public data class Conversation(
     val mentionUnread: Long? = null,
     /** 未读里第一条提及我的 seq（"有人@我"跳转按钮）。 */
     val firstMentionSeq: Long? = null,
+    /** 置顶（PRD-chat F-CVS-01，C5）。 */
+    val pinned: Boolean = false,
+    /** 置顶时间（pinned=true 时才有）。本端刚置顶、还没收到 ack 时是本地估算的服务端时间。 */
+    val pinnedAt: Long? = null,
+    /** 免打扰（F-CVS-02）：列表未读显示小红点，不计入总未读（@ 我的计入）。 */
+    val notifyOff: Boolean = false,
 )
+
+/** 会话设置里能改的字段（convSet、convSettingsChanged）。pinnedAt 只在 pinned 时有。 */
+internal data class ConvSettings(val pinned: Boolean, val pinnedAt: Long?, val notifyOff: Boolean)
+
+internal val Conversation.settings: ConvSettings get() = ConvSettings(pinned, if (pinned) pinnedAt else null, notifyOff)
+
+internal fun Conversation.withSettings(s: ConvSettings): Conversation =
+    copy(pinned = s.pinned, pinnedAt = if (s.pinned) s.pinnedAt else null, notifyOff = s.notifyOff)
 
 /** 撤回的信息（msgDeleted 的 recalled，或 sync 下发的 recalled、recalledBy、recalledAt）。by 为空表示不知道是谁。 */
 @Serializable
@@ -142,6 +156,14 @@ internal interface StoreSink {
     fun addRecalledRefs(convId: String, msgIds: Map<String, RecallInfo>, seqs: Map<Long, RecallInfo>)
     fun addRemovedClient(convId: String, clientMsgIds: Collection<String>)
     fun addExpiredRefs(convId: String, msgIds: Collection<String>)
+
+    /** 物理清除 seq < minSeq 的消息行（F-CVS-03 规则 6 ②），同一事务里去掉这个会话 min_seq ≤ minSeq 的"待清除"标记。 */
+    fun purgeBelow(convId: String, minSeq: Long)
+
+    /** 会话被我删除、没有更新的消息（F-CVS-03 规则 2）：从会话表移到隐藏表，有新消息时用它恢复。c 为 null 表示只从 convs 的 deleted 知道。 */
+    fun hideConversation(convId: String, clearedSeq: Long, c: ConvState?)
+    fun unhideConversation(convId: String)
+    fun replaceHidden(list: Map<String, HiddenConv>)
     fun <T> transaction(block: () -> T): T
 }
 
@@ -157,10 +179,24 @@ internal object NoStoreSink : StoreSink {
     override fun addRecalledRefs(convId: String, msgIds: Map<String, RecallInfo>, seqs: Map<Long, RecallInfo>) = Unit
     override fun addRemovedClient(convId: String, clientMsgIds: Collection<String>) = Unit
     override fun addExpiredRefs(convId: String, msgIds: Collection<String>) = Unit
+    override fun purgeBelow(convId: String, minSeq: Long) = Unit
+    override fun hideConversation(convId: String, clearedSeq: Long, c: ConvState?) = Unit
+    override fun unhideConversation(convId: String) = Unit
+    override fun replaceHidden(list: Map<String, HiddenConv>) = Unit
     override fun <T> transaction(block: () -> T): T = block()
 }
 
 private const val SUMMARY_LEN = 100
+
+/** F-CVS-01 规则 3：置顶在前按 pinnedAt 倒序，其余 updatedAt 倒序，同时间 convId 升序（同 sdk-ts 的 compareConvs）。 */
+private val CONV_ORDER: Comparator<Conversation> = Comparator { a, b ->
+    when {
+        a.pinned != b.pinned -> if (a.pinned) -1 else 1
+        a.pinned && (a.pinnedAt ?: 0) != (b.pinnedAt ?: 0) -> (b.pinnedAt ?: 0).compareTo(a.pinnedAt ?: 0)
+        !a.pinned && a.updatedAt != b.updatedAt -> b.updatedAt.compareTo(a.updatedAt)
+        else -> a.convId.compareTo(b.convId)
+    }
+}
 
 /** 过期后的内容：标记 expired，文件名清空（服务端同样清空，F-FILE-06 规则 3）。 */
 internal fun expireBody(body: MsgBody): MsgBody = when {
@@ -177,6 +213,36 @@ private fun recallOf(m: ServerMessage): RecallInfo? = if (m.recalled) RecallInfo
 
 /** 引用清除原文（F-QUO-02 规则 4）：只留定位用的 msgId、seq、from、type 和新状态。 */
 private fun clearedQuote(q: QuoteView, state: QuoteState): QuoteView = q.copy(state = state, text = null)
+
+/** 被我删除、还没有新消息的会话（F-CVS-03 规则 2）。conv 是删除前本地的会话（已按 clearedView 更新）；只从 deleted 知道的没有。 */
+internal class HiddenConv(val clearedSeq: Long, val conv: ConvState?)
+
+/**
+ * 删除到 clearedSeq 后的会话（frontend-chat 第 55 条，同 sdk-ts 的 clearedState）：minSeq = clearedSeq + 1、
+ * readSeq = max(readSeq, clearedSeq)、不再置顶、保留免打扰。全部清除时摘要也去掉（隐藏的会话写进本地库，摘要是原文）。
+ * 清除范围内的提及已读掉了：全部读完时清零；还有更新的消息时只能等下次 convs 的权威计数（问题 64）。
+ */
+internal fun clearedView(v: Conversation, clearedSeq: Long): Conversation {
+    val maxSeq = maxOf(v.maxSeq, clearedSeq)
+    val readSeq = maxOf(v.readSeq, clearedSeq)
+    val allRead = readSeq >= maxSeq
+    var mentions = v.mentionUnread
+    var first = v.firstMentionSeq
+    if (allRead || (first != null && first <= clearedSeq)) {
+        first = null
+        if (mentions != null && allRead) mentions = 0
+    }
+    return v.copy(
+        minSeq = maxOf(v.minSeq, clearedSeq + 1),
+        readSeq = readSeq,
+        maxSeq = maxSeq,
+        lastMsg = if (v.maxSeq <= clearedSeq) null else v.lastMsg,
+        pinned = false,
+        pinnedAt = null,
+        mentionUnread = mentions,
+        firstMentionSeq = first,
+    )
+}
 
 private fun withRecall(m: Message, r: RecallInfo): Message =
     m.copy(recalled = true, recalledBy = r.by.takeIf { it.isNotEmpty() } ?: m.recalledBy, recalledAt = r.at ?: m.recalledAt)
@@ -212,6 +278,10 @@ internal class MessageList(private val convId: String, private val self: () -> S
     /** 向前翻页是否还有更早的消息。 */
     var hasMoreHistory = true
 
+    /** 本地可见的最小 seq（会话的 minSeq，F-CVS-03 规则 2、6）：更小的消息已物理清除，迟到的 sync、ack 也不再写进来。 */
+    var floor = 1L
+        private set
+
     private val sink get() = sinkOf(convId)
 
     /**
@@ -221,6 +291,7 @@ internal class MessageList(private val convId: String, private val self: () -> S
      * deleted=false 或 quote.state=NORMAL 时不回写。返回合并后的消息，没有变化时为 null。
      */
     fun addServer(m: ServerMessage): Message? {
+        if (m.seq < floor) return null
         if (m.clientMsgId in removedClient && m.from == self()) return null
         val deleted = m.deleted || isDeleted(m.msgId, m.seq)
         val recall = recallOf(m) ?: recallOf(m.msgId, m.seq)
@@ -341,6 +412,56 @@ internal class MessageList(private val convId: String, private val self: () -> S
             changed = true
         }
         return changed
+    }
+
+    /** 有没有 seq < minSeq 的已加载消息（要不要先记"待清除"）。 */
+    fun hasBelow(minSeq: Long): Boolean = minSeq > floor && bySeq.keys.any { it < minSeq }
+
+    /**
+     * 物理清除 seq < minSeq 的消息（F-CVS-03 规则 6 ②，AC-CVS-03-10）：内存和本地库的行一起去掉，文件经 newlyExpired 清地址和缓存，
+     * 之后到的 sync 结果、发送 ack 也不再写进来。还没发出的本地消息里引用了被清除消息的，清除引用原文（state=DELETED）；
+     * 已发出的、seq ≥ minSeq 的消息（删除之后的新消息）的引用由服务端组装，照常显示（P-46 ④，问题 62）。返回是否有变化。
+     */
+    fun purgeBelow(minSeq: Long): Boolean {
+        if (minSeq <= floor) return false
+        floor = minSeq
+        var changed = false
+        val gone = HashSet<String>()
+        for ((seq, m) in bySeq.entries.toList()) {
+            if (seq >= minSeq) continue
+            m.body.fileId?.takeIf { it.isNotEmpty() }?.let { newlyExpired.add(it) }
+            bySeq.remove(seq)
+            if (byClient[m.clientMsgId] === m) byClient.remove(m.clientMsgId)
+            m.msgId?.let {
+                byMsgId.remove(it)
+                gone.add(it)
+            }
+            changed = true
+        }
+        for (m in unsent.toList()) {
+            val q = m.body.quote ?: continue
+            if (q.state != QuoteState.NORMAL) continue
+            if (q.msgId !in gone && !(q.seq != null && q.seq < minSeq)) continue
+            update(m.clientMsgId) { it.copy(body = it.body.copy(quote = clearedQuote(q, QuoteState.DELETED))) }?.let { sink.wipeMessage(it) }
+            changed = true
+        }
+        val oldest = bySeq.keys.minOrNull() ?: 0L
+        oldestSeq = oldest
+        if (oldest == 0L || oldest <= minSeq) hasMoreHistory = oldest == 0L
+        if (changed) sink.purgeBelow(convId, minSeq)
+        return changed
+    }
+
+    /** 服务端的 minSeq 变小了（重新入群按新成员算，historyVisible=true 时能看到全部历史，F-CVS-03 规则 6a）：之前的消息又可以加载。 */
+    fun lowerFloor(minSeq: Long) {
+        if (minSeq >= floor) return
+        floor = maxOf(1, minSeq)
+        hasMoreHistory = true
+    }
+
+    /** 新建列表时的初始值（会话的 minSeq，或被删除隐藏的 clearedSeq + 1）：列表是空的，不用清除。 */
+    fun initFloor(minSeq: Long) {
+        floor = maxOf(1, minSeq)
     }
 
     /** 按 msgId 找已加载的消息（引用、撤回用）。 */
@@ -486,40 +607,173 @@ internal class Store(private val self: () -> String, private val sink: StoreSink
 
     // ---- 会话 ----
 
+    /** setConversations 的结果：推断为"被移出"的群，和消息被物理清除过的会话（调用方发 MessagesChanged）。 */
+    class ConvsApplied(val gone: List<String>, val purged: List<String>)
+
     /**
      * 用服务端的会话列表覆盖本地（convs 的结果）。返回推断为"被移出"的群：原来在、新列表里没有的群会话
      * （服务端不为离线期间的移出补发 convRemoved，G-UI-21 ②）。列表被截断时不推断，单聊不推断。
+     * deleted（C5，F-CVS-03 规则 6 ①）里的会话是被我删除的：从列表移除，不生成快照、不算被移出（AC-CVS-03-5）；
+     * deletedTruncated 时 deleted 不全，和 truncated 一样不推断（frontend-chat 第 54 条），原来隐藏的也保留。
+     * 物理清除（规则 6 ②）：列表里的会话按 minSeq，deleted 里的按 clearedSeq + 1。调用方先用 purgeTargets 记"待清除"。
      */
-    fun setConversations(list: List<ServerConversation>, truncated: Boolean): List<String> {
+    fun setConversations(
+        list: List<ServerConversation>,
+        truncated: Boolean,
+        deleted: List<DeletedConv> = emptyList(),
+        deletedTruncated: Boolean = false,
+    ): ConvsApplied {
         val next = LinkedHashMap<String, ConvState>()
         for (c in list) next[c.convId] = fromServer(c)
+        val nextHidden = LinkedHashMap<String, HiddenConv>()
+        if (deletedTruncated) for ((id, h) in hidden) if (id !in next) nextHidden[id] = h
+        for (d in deleted) {
+            if (d.convId in next) continue
+            val old = convs[d.convId] ?: hidden[d.convId]?.conv
+            nextHidden[d.convId] = HiddenConv(d.clearedSeq, old?.let { cleared(it, d.clearedSeq) })
+        }
         val gone = ArrayList<String>()
-        if (!truncated) {
+        if (!truncated && !deletedTruncated) {
             for ((id, c) in convs) {
-                if (c.view.type == ConvType.GROUP && id !in next && id !in placeholders) {
+                if (c.view.type == ConvType.GROUP && id !in next && id !in nextHidden && id !in placeholders) {
                     snapshots[id] = ConversationSnapshot(id, c.view.type, c.view.name)
                     gone.add(id)
                 }
             }
         }
+        val purged = ArrayList<String>()
+        for ((id, c) in next) {
+            val l = msgs[id] ?: continue
+            if (id in snapshots) l.lowerFloor(c.view.minSeq) // 重新入群按新成员算（规则 6a）
+            if (l.purgeBelow(c.view.minSeq)) purged.add(id)
+        }
+        for ((id, h) in nextHidden) if (msgs[id]?.purgeBelow(h.clearedSeq + 1) == true) purged.add(id)
         for (id in next.keys) {
             if (snapshots.remove(id) != null) msgs[id]?.persistAll()
         }
         convs = next
+        hidden = nextHidden
         placeholders.clear()
+        pendingDelete.retainAll(next.keys)
         this.truncated = truncated
         sink.replaceConversations(next.values.map { it to false })
+        sink.replaceHidden(nextHidden)
         for (id in gone) sink.deleteConversation(id)
-        return gone
+        return ConvsApplied(gone, purged)
     }
 
-    fun upsertConversation(c: ServerConversation) {
+    /** 这些会话按给定的 minSeq 清除时，哪些真的有消息要清（调用方先在本地库记"待清除"，单独提交，F-CVS-03 异常）。 */
+    fun purgeTargets(mins: Map<String, Long>): Map<String, Long> = mins.filter { (id, min) -> msgs[id]?.hasBelow(min) == true }
+
+    /** 下一次 convs 各会话会按什么 minSeq 清除。 */
+    fun convsPurgeMins(list: List<ServerConversation>, deleted: List<DeletedConv>): Map<String, Long> {
+        val out = HashMap<String, Long>()
+        for (c in list) out[c.convId] = c.minSeq
+        for (d in deleted) if (d.convId !in out) out[d.convId] = d.clearedSeq + 1
+        return out
+    }
+
+    /**
+     * 服务端下发的完整会话（convAdded、convSet 的 ack）。rejoin=true（convAdded）时服务端的 minSeq 可以比本地的小（重新入群）。
+     * 返回消息是否被物理清除过。
+     */
+    fun upsertConversation(c: ServerConversation, rejoin: Boolean = false): Boolean {
         val state = fromServer(c)
         convs[c.convId] = state
         placeholders.remove(c.convId)
+        if (hidden.remove(c.convId) != null) sink.unhideConversation(c.convId)
+        val l = msgs[c.convId]
+        if (l != null && (rejoin || c.convId in snapshots)) l.lowerFloor(c.minSeq)
+        val purged = l?.purgeBelow(c.minSeq) == true
         // 重新被拉进群：清除快照（G-UI-21 ③），内存里的消息重新写回本地库，否则下次冷启动中间会缺一段。
         if (snapshots.remove(c.convId) != null) msgs[c.convId]?.persistAll()
         sink.upsertConversation(state, false)
+        return purged
+    }
+
+    // ---- 会话设置、删除（C5，PRD-chat F-CVS） ----
+
+    /** 被我删除、还没有新消息的会话（F-CVS-03 规则 2）：有新消息时用它恢复（minSeq、已读位置、免打扰、名称）。 */
+    private var hidden = LinkedHashMap<String, HiddenConv>()
+
+    /** deleteConv 等 ack 期间先从列表里拿掉（乐观更新）；失败时 cancelDelete 恢复。 */
+    private val pendingDelete = HashSet<String>()
+
+    fun hideForDelete(convId: String) {
+        pendingDelete.add(convId)
+    }
+
+    fun cancelDelete(convId: String): Boolean = pendingDelete.remove(convId)
+
+    private fun cleared(c: ConvState, clearedSeq: Long): ConvState = ConvState(clearedView(c.view, clearedSeq), c.readBase).also { recount(it) }
+
+    /**
+     * 会话被删除到 clearedSeq（本端 deleteConv 的 ack，或其他端的 convDeleted，frontend-chat 第 55 条）：按 clearedView 更新、
+     * 物理清除 seq ≤ clearedSeq 的消息；本地没有更新的消息时从列表移除（不是被移出，没有快照）。返回消息是否有变化。
+     */
+    fun clearConversation(convId: String, clearedSeq: Long): Boolean {
+        pendingDelete.remove(convId)
+        val c = convs[convId]
+        val prev = hidden[convId]
+        val seq = maxOf(clearedSeq, prev?.clearedSeq ?: 0)
+        if (c != null) {
+            val next = cleared(c, seq)
+            if (next.view.maxSeq > seq) {
+                convs[convId] = next
+                saveConv(next)
+            } else {
+                convs.remove(convId)
+                placeholders.remove(convId)
+                hidden[convId] = HiddenConv(seq, next)
+                sink.hideConversation(convId, seq, next)
+            }
+        } else {
+            val h = HiddenConv(seq, prev?.conv?.let { cleared(it, seq) })
+            hidden[convId] = h
+            sink.hideConversation(convId, seq, h.conv)
+        }
+        val l = msgs[convId]
+        if (l == null) {
+            list(convId) // 还没加载过也要记下 minSeq：之后迟到的应答不能把清除范围内的消息写进来
+            return false
+        }
+        return l.purgeBelow(seq + 1)
+    }
+
+    /** 改置顶、免打扰（本端乐观更新、回滚、ack，或其他端的 convSettingsChanged）。被删除隐藏的会话也记下（backend-chat 第 85 条）。 */
+    fun setSettings(convId: String, s: ConvSettings): Boolean {
+        val visible = convs[convId]
+        val h = hidden[convId]
+        val c = visible ?: h?.conv ?: return false
+        if (c.view.settings == s) return false
+        c.view = c.view.withSettings(s)
+        if (visible != null) saveConv(c) else sink.hideConversation(convId, h!!.clearedSeq, c)
+        return visible != null
+    }
+
+    /** 会话当前的置顶、免打扰（含被删除隐藏的会话）。不认识的会话为 null。 */
+    fun settings(convId: String): ConvSettings? = (convs[convId] ?: hidden[convId]?.conv)?.view?.settings
+
+    /**
+     * convSet 的 ack（第 13.1 节：ack 的 conv 覆盖本地）。被删除隐藏的会话只更新设置，不让它重新出现；
+     * 本地已经收到比 ack 更新的消息时只取设置，其他字段等下次 convs。
+     */
+    fun applyConvAck(conv: ServerConversation): Boolean {
+        val c = convs[conv.convId]
+        if ((c == null && conv.convId in hidden) || (c != null && c.view.maxSeq > conv.maxSeq)) {
+            setSettings(conv.convId, ConvSettings(conv.pinned, if (conv.pinned) conv.pinnedAt else null, conv.notifyOff))
+            return false
+        }
+        return upsertConversation(conv)
+    }
+
+    /** 本地可见的最小 seq：会话的 minSeq，被删除隐藏的是 clearedSeq + 1（翻页到这里就不再请求）。 */
+    fun minSeqOf(convId: String): Long = convs[convId]?.view?.minSeq ?: hidden[convId]?.let { it.clearedSeq + 1 } ?: 1
+
+    fun isHidden(convId: String): Boolean = convId in hidden
+
+    fun restoreHidden(convId: String, clearedSeq: Long, view: Conversation?, readBase: Long) {
+        hidden[convId] = HiddenConv(clearedSeq, view?.let { ConvState(it, readBase) })
     }
 
     /** 被移出群：从列表移除并保留快照；本地库里这个会话连同消息一起删除（FE-435）。 */
@@ -532,6 +786,8 @@ internal class Store(private val self: () -> String, private val sink: StoreSink
             reason,
         )
         convs.remove(convId)
+        hidden.remove(convId)
+        pendingDelete.remove(convId)
         placeholders.remove(convId)
         sink.deleteConversation(convId)
     }
@@ -543,11 +799,12 @@ internal class Store(private val self: () -> String, private val sink: StoreSink
     private var lastList: List<Conversation>? = null
 
     /**
-     * 按 updatedAt 倒序、convId 升序（与服务端一致）。
+     * 置顶的在最前（pinnedAt 倒序），其余按 updatedAt 倒序，时间相同按 convId 升序（F-CVS-01 规则 3，与服务端一致）。
+     * 等 deleteConv 的 ack 期间的会话不在里面。
      * 快照稳定（G-UI-19）：没有变化的会话返回同一个对象，整体没有变化时返回同一个列表，界面可以按引用比较。
      */
     fun conversations(): List<Conversation> {
-        val sorted = convs.values.map { it.view }.sortedWith(compareByDescending<Conversation> { it.updatedAt }.thenBy { it.convId })
+        val sorted = convs.values.map { it.view }.filter { it.convId !in pendingDelete }.sortedWith(CONV_ORDER)
         val prev = lastList
         if (prev != null && prev.size == sorted.size && prev.indices.all { prev[it] === sorted[it] }) return prev
         lastList = sorted
@@ -566,6 +823,7 @@ internal class Store(private val self: () -> String, private val sink: StoreSink
             c.convId, c.type, c.name, c.maxSeq, c.readSeq, c.minSeq, c.unread,
             last,
             c.updatedAt, c.memberCount, c.myRole, c.modVer, c.mentionUnread, c.firstMentionSeq,
+            c.pinned, if (c.pinned) c.pinnedAt else null, c.notifyOff,
         )
         // 同一内容保留原对象（G-UI-19）：500 个会话刷新一次，没变的引用不变。
         val old = convs[c.convId]?.view
@@ -615,7 +873,7 @@ internal class Store(private val self: () -> String, private val sink: StoreSink
 
     // ---- 消息 ----
 
-    fun list(convId: String): MessageList = msgs.getOrPut(convId) { MessageList(convId, self, sinkFor) }
+    fun list(convId: String): MessageList = msgs.getOrPut(convId) { MessageList(convId, self, sinkFor).also { it.initFloor(minSeqOf(convId)) } }
 
     fun listIfExists(convId: String): MessageList? = msgs[convId]
 
@@ -735,9 +993,26 @@ internal class Store(private val self: () -> String, private val sink: StoreSink
         return true
     }
 
-    /** 第一次收到某个会话的消息、本地还没有这个会话时，先补一个临时的；重新拉取 convs 后被服务端数据覆盖。 */
+    /**
+     * 第一次收到某个会话的消息、本地还没有这个会话时，先补一个临时的；重新拉取 convs 后被服务端数据覆盖。
+     * 被我删除的会话有了新消息（seq > clearedSeq）：按删除时的状态恢复，未读只算新消息，minSeq = clearedSeq + 1
+     * （F-CVS-03 规则 3，AC-CVS-03-2）。
+     */
     private fun newConversation(m: ServerMessage): ConvState {
-        val parts = m.convId.split(":")
+        val h = hidden.remove(m.convId)
+        val c = if (h != null) {
+            sink.unhideConversation(m.convId)
+            cleared(h.conv ?: ConvState(bareView(m.convId).copy(maxSeq = h.clearedSeq), 0), h.clearedSeq)
+        } else {
+            ConvState(bareView(m.convId), 0)
+        }
+        convs[m.convId] = c
+        placeholders.add(m.convId)
+        return c
+    }
+
+    private fun bareView(convId: String): Conversation {
+        val parts = convId.split(":")
         val type = when (parts[0]) {
             "c2c" -> ConvType.C2C
             "group" -> ConvType.GROUP
@@ -747,15 +1022,13 @@ internal class Store(private val self: () -> String, private val sink: StoreSink
         val a = parts.getOrElse(1) { "" }
         val b = parts.getOrElse(2) { "" }
         val name = if (type == ConvType.C2C) (if (a == self()) b else a) else a
-        val c = ConvState(Conversation(m.convId, type, name, 0, 0, 1, 0, null, 0), 0)
-        convs[m.convId] = c
-        placeholders.add(m.convId)
-        return c
+        return Conversation(convId, type, name, 0, 0, 1, 0, null, 0)
     }
 
     /** 全部写回本地库（被踢清库之后，同一账号重新登录时用）。 */
     fun persistAll() {
         sink.replaceConversations(convs.values.map { it to (it.view.convId in placeholders) })
+        sink.replaceHidden(hidden)
         for (l in msgs.values) l.persistAll()
     }
 

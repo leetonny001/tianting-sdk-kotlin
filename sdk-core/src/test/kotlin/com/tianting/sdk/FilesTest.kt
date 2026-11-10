@@ -618,7 +618,7 @@ class FilesTest : AccountTest() {
     }
 
     @Test
-    fun `本地库第 1 版原地升级（第 2 版的表，现在直接到第 3 版）：已有的会话和消息（含失败的）保留`() {
+    fun `本地库第 1 版原地升级（第 2 版的表，现在直接到第 4 版）：已有的会话和消息（含失败的）保留`() {
         val file = File(tmp, "v1.db")
         JdbcLocalDatabase(file).use { db ->
             db.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -649,8 +649,9 @@ class FilesTest : AccountTest() {
         assertEquals("bob", h.convOf("c2c:alice:bob").name)
         h.call { close() }
         JdbcLocalDatabase(file).use { db ->
-            assertEquals(3L, db.query("PRAGMA user_version").single().values.single())
+            assertEquals(4L, db.query("PRAGMA user_version").single().values.single())
             assertEquals(0, db.query("SELECT * FROM mod_vers").size)
+            assertEquals(0, db.query("SELECT * FROM cleared_convs").size)
             assertEquals(2, db.query("SELECT conv_id FROM messages").size)
             assertEquals(0, db.query("SELECT * FROM attachments").size)
         }

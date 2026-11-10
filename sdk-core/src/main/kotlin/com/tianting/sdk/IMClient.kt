@@ -30,6 +30,7 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.longOrNull
@@ -64,6 +65,12 @@ public sealed interface IMEvent {
      * App 自己另外缓存过（例如图片库的内存缓存）的也要清掉。
      */
     public data class FilesExpired(val fileIds: List<String>) : IMEvent
+
+    /**
+     * 会话被删除（PRD-chat F-CVS-03、F-CVS-04 规则 1）：本端 deleteConv 成功，或同一账号的其他设备删除了它。本地消息已清除，
+     * 页面清除这个会话的草稿（规则 7 的"清除本地草稿"按会话算，不只是操作的那台，frontend-chat 第 55 条）。
+     */
+    public data class ConvDeleted(val convId: String) : IMEvent
 
     /** 账号在新设备登录等安全提醒（PRD-chat F-ACC-02 规则 3b）。不认识的 kind 不发。 */
     public data class SecurityNotice(val kind: String, val at: Long, val platform: String?) : IMEvent
@@ -286,7 +293,10 @@ public class IMClient(private val o: IMClientOptions) {
     /** 会话列表（已排序，不可变）。 */
     public val conversations: StateFlow<List<Conversation>> = _conversations.asStateFlow()
 
-    /** 全部会话的未读总数（与 conversations 同一轮更新，PRD-ui G-UI-15）。 */
+    /**
+     * 总未读（与 conversations 同一轮更新，PRD-ui G-UI-15）：普通会话的 unread 之和 + 免打扰会话的 mentionUnread 之和
+     * （PRD-chat F-CVS-02 规则 4，@ 我计入）。标签角标用它（AC-CVS-02-2、02-5）。
+     */
     public val totalUnread: StateFlow<Long> = _totalUnread.asStateFlow()
 
     /** 发送中 / 排队 / 失败的消息总数（退出登录确认、离开页面提示用，G-UI-20）。 */
@@ -506,6 +516,117 @@ public class IMClient(private val o: IMClientOptions) {
             m.deleted -> base.copy(state = if (m.recalled) QuoteState.RECALLED else QuoteState.DELETED)
             else -> base.copy(text = quoteSummary(m))
         }
+    }
+
+    // ---- 置顶、免打扰、删除会话（FE-681，PRD-chat 第 9 节 C5） ----
+
+    /**
+     * 置顶 / 取消置顶（F-CVS-01，第 13.1 节）。乐观更新：本地先改（新置顶的 pinnedAt 先用校正后的服务端时间，已置顶的再置顶不变），
+     * ack 的 conv 覆盖本地；失败（5000、4220 置顶已满、4290、4030 开关关闭或没有权限、超时、未连接）回滚并抛出，
+     * 不自动重试（frontend-chat 第 56 条）。等待期间其他端的 convSettingsChanged 改过的不回滚。
+     */
+    public suspend fun setConvPinned(convId: String, pinned: Boolean): Unit = onSdk {
+        val data = buildJsonObject {
+            put("convId", convId)
+            put("pinned", pinned)
+        }
+        changeSettings(convId, data) { s ->
+            if (pinned) s.copy(pinned = true, pinnedAt = if (s.pinned) s.pinnedAt else serverNow()) else s.copy(pinned = false, pinnedAt = null)
+        }
+    }
+
+    /** 免打扰 / 取消免打扰（F-CVS-02）。乐观更新和失败处理同 setConvPinned。 */
+    public suspend fun setConvNotifyOff(convId: String, on: Boolean): Unit = onSdk {
+        val data = buildJsonObject {
+            put("convId", convId)
+            put("notifyOff", on)
+        }
+        changeSettings(convId, data) { it.copy(notifyOff = on) }
+    }
+
+    private suspend fun changeSettings(convId: String, data: JsonObject, next: (ConvSettings) -> ConvSettings) {
+        if (self.isEmpty()) throw NotConnectedError()
+        val before = store.settings(convId)
+        val optimistic = before?.let(next)
+        if (optimistic != null) {
+            var changed = false
+            store.transaction { changed = store.setSettings(convId, optimistic) }
+            if (changed) emitConversations()
+        }
+        val ack = try {
+            req("convSet", data, ConvSetAck.serializer())
+        } catch (e: Exception) {
+            // 回滚只在本地还是这次乐观的值时做：等待期间其他端的 convSettingsChanged 已经改过的不覆盖（后到的覆盖，F-CVS-04 异常）。
+            if (before != null && optimistic != null && store.settings(convId) == optimistic) {
+                var changed = false
+                store.transaction { changed = store.setSettings(convId, before) }
+                if (changed) emitConversations()
+            }
+            throw e
+        }
+        var purged = false
+        store.transaction { purged = store.applyConvAck(ack.conv) }
+        if (purged) emitMessages(convId)
+        setGroupMute(ack.conv.convId, ack.conv.mutedUntil, ack.conv.allMuted)
+        mutesChanged()
+        emitConversations()
+    }
+
+    /**
+     * 删除会话（F-CVS-03，第 13.1 节）：upToSeq 是本地看到的最大 seq。乐观更新：会话先从列表消失；成功后按 clearedSeq 物理清除
+     * 本地消息、本地库的行和文件缓存（FilesExpired），这个会话还没发出的附件取消上传（DELETE 临时对象）、排队和失败的消息丢弃
+     * （frontend-chat 第 59 条），然后发 ConvDeleted 让页面清草稿。失败时会话恢复、抛出，不自动重试（第 56 条）。确认框由页面弹。
+     */
+    public suspend fun deleteConv(convId: String): Unit = onSdk {
+        if (self.isEmpty()) throw NotConnectedError()
+        val upToSeq = maxOf(store.maxSeq(convId), store.conversation(convId)?.maxSeq ?: 0)
+        store.hideForDelete(convId)
+        emitConversations()
+        val data = buildJsonObject {
+            put("convId", convId)
+            put("upToSeq", upToSeq)
+        }
+        val ack = try {
+            req("convDelete", data, ConvDeleteAck.serializer())
+        } catch (e: Exception) {
+            if (store.cancelDelete(convId)) emitConversations()
+            throw e
+        }
+        discardUnsent(convId)
+        onConvCleared(convId, ack.clearedSeq)
+    }
+
+    /** 丢掉这个会话还没发出的消息：附件按 cancelUpload（已申请的发 DELETE），文本的排队、失败消息直接移除。发送中的不动。 */
+    private suspend fun discardUnsent(convId: String) {
+        val list = store.listIfExists(convId) ?: return
+        for (m in store.messages(convId)) {
+            if (m.seq != null) continue
+            if (m.type == MsgType.IMAGE || m.type == MsgType.FILE) {
+                cancelUpload(convId, m.clientMsgId)
+            } else {
+                var removed = false
+                store.transaction { removed = list.removeUnsent(m.clientMsgId, setOf(MessageStatus.QUEUED, MessageStatus.FAILED)) }
+                if (removed) dropSource(m.clientMsgId)
+            }
+        }
+    }
+
+    /**
+     * 本端删除成功或收到其他端的 convDeleted（AC-CVS-04-5）：先在本地库记"待清除"，再清除、移除，通知页面清草稿。
+     * 其他端删除时本机没发出的消息不丢（问题 63）：它们发出后 seq > clearedSeq，会话本来就会重新出现。
+     */
+    private fun onConvCleared(convId: String, clearedSeq: Long) {
+        markPurges(mapOf(convId to clearedSeq + 1))
+        store.transaction { store.clearConversation(convId, clearedSeq) }
+        emitMessages(convId)
+        emitConversations()
+        emit(IMEvent.ConvDeleted(convId))
+    }
+
+    /** 清除之前在本地库记"待清除"（单独提交）：清除失败或进程在中间结束时，下次启动补清（F-CVS-03 异常）。 */
+    private fun markPurges(mins: Map<String, Long>) {
+        val db = local ?: return
+        db.markPurges(store.purgeTargets(mins))
     }
 
     // ---- 撤回（FE-661，PRD-chat F-RCL-01～03） ----
@@ -1109,7 +1230,7 @@ public class IMClient(private val o: IMClientOptions) {
         if (!list.hasMoreHistory) return@onSdk false
         if (c == null && list.oldestSeq == 0L && store.maxSeq(convId) == 0L) return@onSdk loadUnknown(convId, limit)
         val before = if (list.oldestSeq != 0L) list.oldestSeq else maxOf(c?.maxSeq ?: 0, store.maxSeq(convId)) + 1
-        if (before <= (c?.minSeq ?: 1)) {
+        if (before <= store.minSeqOf(convId)) {
             list.hasMoreHistory = false
             return@onSdk false
         }
@@ -1589,6 +1710,12 @@ public class IMClient(private val o: IMClientOptions) {
             self = owner
             _userId.value = owner
             for ((view, base, placeholder) in r.conversations) store.restoreConversation(view, base, placeholder)
+            for (h in r.hidden) store.restoreHidden(h.convId, h.clearedSeq, h.view, h.readBase)
+            // 上次没清完、这次启动在 open() 里补清了的：缓存文件也删掉（F-CVS-03 异常）。
+            o.fileCacheDir?.let { dir ->
+                val targets = r.purgedFiles.flatMap { id -> FileVariant.entries.map { cacheFile(dir, id, it) } }
+                if (targets.isNotEmpty()) scope.launch(io) { targets.forEach { it.delete() } }
+            }
             for ((convId, refs) in r.deletedRefs) store.list(convId).restoreRefs(refs)
             // 上次进程结束时还没发出去的消息：标记失败，由用户决定是否重发（不在用户不知情时发出旧消息）。
             val unsentToFail = ArrayList<Message>()
@@ -1803,7 +1930,8 @@ public class IMClient(private val o: IMClientOptions) {
             }
             "convAdded" -> {
                 val conv = ImJson.decodeFromJsonElement(ServerConversation.serializer(), ev["conv"] ?: return)
-                store.upsertConversation(conv)
+                markPurges(mapOf(conv.convId to conv.minSeq))
+                if (store.upsertConversation(conv, rejoin = true)) emitMessages(conv.convId)
                 setGroupMute(conv.convId, conv.mutedUntil, conv.allMuted)
                 mutesChanged()
                 emitConversations()
@@ -1846,6 +1974,22 @@ public class IMClient(private val o: IMClientOptions) {
                 social.settings = social.settings.copy(mode = mode, strangerMsgLimit = limit)
                 local?.saveMeta(social)
                 emitSocial()
+            }
+            "convSettingsChanged" -> {
+                // 其他端改的置顶、免打扰：以事件为准覆盖本地（AC-CVS-04-1）。本地不认识的会话等下次 convs。
+                val convId = string(ev, "convId") ?: return
+                val pinned = (ev["pinned"] as? JsonPrimitive)?.takeIf { !it.isString }?.booleanOrNull ?: return
+                val off = (ev["notifyOff"] as? JsonPrimitive)?.takeIf { !it.isString }?.booleanOrNull ?: return
+                val at = if (pinned) (ev["pinnedAt"] as? JsonPrimitive)?.takeIf { !it.isString }?.longOrNull else null
+                var changed = false
+                store.transaction { changed = store.setSettings(convId, ConvSettings(pinned, at, off)) }
+                if (changed) emitConversations()
+            }
+            "convDeleted" -> {
+                // 其他端删除了会话（AC-CVS-04-5）：已读到 clearedSeq、不再置顶、minSeq = clearedSeq + 1（backend-chat 第 84 条）。
+                val convId = string(ev, "convId") ?: return
+                val cleared = (ev["clearedSeq"] as? JsonPrimitive)?.takeIf { !it.isString }?.longOrNull?.takeIf { it >= 0 } ?: return
+                onConvCleared(convId, cleared)
             }
             // 不认识的事件类型忽略（协议 README 第 3 节规则 9）。
         }
@@ -2033,11 +2177,15 @@ public class IMClient(private val o: IMClientOptions) {
         }
     }
 
-    /** 用 convs 的结果覆盖会话列表；原来在、新列表没有的群视为被移出（截断时不推断）。 */
+    /**
+     * 用 convs 的结果覆盖会话列表；原来在、新列表没有的群视为被移出（截断时不推断）。deleted 里的不是被移出（AC-CVS-03-5）。
+     * 物理清除 seq < minSeq 的本地消息（F-CVS-03 规则 6 ②）：先记"待清除"，再在同一个事务里清除。
+     */
     private fun applyConvs(ack: ConvsAck) {
-        var gone: List<String> = emptyList()
+        var applied = Store.ConvsApplied(emptyList(), emptyList())
+        markPurges(store.convsPurgeMins(ack.convs, ack.deleted))
         store.transaction {
-            gone = store.setConversations(ack.convs, ack.truncated)
+            applied = store.setConversations(ack.convs, ack.truncated, ack.deleted, ack.deletedTruncated)
             for (c in ack.convs) {
                 // 还没加载过消息的会话：之后加载到的就是这个版本以后的内容，记下作为基线。已加载的等重拉成功再更新。
                 if (c.modVer != null && !store.isLoaded(c.convId) && modVers[c.convId] != c.modVer) setModVer(c.convId, c.modVer)
@@ -2048,6 +2196,8 @@ public class IMClient(private val o: IMClientOptions) {
                 }
             }
         }
+        val gone = applied.gone
+        for (id in applied.purged) emitMessages(id)
         lastRefreshAt = clock.now()
         _truncated.value = store.truncated
         for (c in ack.convs) setGroupMute(c.convId, c.mutedUntil, c.allMuted)
@@ -2264,7 +2414,8 @@ public class IMClient(private val o: IMClientOptions) {
     private fun emitConversations() {
         val list = store.conversations()
         _conversations.value = list
-        _totalUnread.value = list.sumOf { it.unread }
+        // F-CVS-02 规则 4：免打扰会话只计 @ 我的未读。
+        _totalUnread.value = list.sumOf { if (it.notifyOff) it.mentionUnread ?: 0L else it.unread }
     }
 
     private fun emitMessagesQuiet(convId: String) {

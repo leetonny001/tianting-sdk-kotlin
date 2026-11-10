@@ -103,7 +103,7 @@ class AndroidAdapterTest {
     }
 
     @Test
-    fun `FE-661：第 2 版的库在系统 SQLite 上原地升级到第 3 版（旧行保留）；撤回后数据库文件搜不到原文和引用原文，冷启动仍是撤回`() {
+    fun `FE-661：第 2 版的库在系统 SQLite 上原地升级（现在到第 4 版，旧行保留）；撤回后数据库文件搜不到原文和引用原文，冷启动仍是撤回`() {
         val dir = tmp.newFolder()
         val file = File(dir, "im.db")
         // 第 2 版的库（C2 的表结构），里面有一条含特征串的消息和引用它的消息。
@@ -150,7 +150,7 @@ class AndroidAdapterTest {
         assertEquals(emptyList(), dir.listFiles()!!.map { it.name }.filter { it.endsWith("-wal") })
         e.close()
         AndroidLocalDatabase.open(file).use { db ->
-            assertEquals(3L, db.query("PRAGMA user_version").single().values.single())
+            assertEquals(4L, db.query("PRAGMA user_version").single().values.single())
             assertEquals(setOf("client", "id", "seq", "recalled"), db.query("SELECT kind FROM deleted_refs").map { it["kind"] }.toSet())
         }
         val e2 = Env(file)
@@ -159,6 +159,69 @@ class AndroidAdapterTest {
         assertEquals("recalled", list[1].body.quote!!.state.wire)
         e2.close()
         assertEquals(emptyList(), filesContaining(dir, secret))
+    }
+
+    @Test
+    fun `FE-681：第 3 版的库在系统 SQLite 上原地升级到第 4 版；convs 的 deleted 和其他设备的 convDeleted 物理清除，数据库文件搜不到特征串，没有 -wal；冷启动仍隐藏`() {
+        val dir = tmp.newFolder()
+        val file = File(dir, "im.db")
+        val s2 = "ZXQ-CVS-ANDROID"
+        AndroidLocalDatabase.open(file).use { db ->
+            db.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            db.execute("CREATE TABLE conversations(conv_id TEXT PRIMARY KEY, read_base INTEGER NOT NULL, placeholder INTEGER NOT NULL, json TEXT NOT NULL)")
+            db.execute("CREATE TABLE messages(conv_id TEXT NOT NULL, row_key TEXT NOT NULL, seq INTEGER, json TEXT NOT NULL, PRIMARY KEY(conv_id, row_key))")
+            db.execute("CREATE TABLE deleted_refs(conv_id TEXT NOT NULL, kind TEXT NOT NULL, ref TEXT NOT NULL, PRIMARY KEY(conv_id, kind, ref))")
+            db.execute("CREATE TABLE social_meta(id INTEGER PRIMARY KEY CHECK(id = 1), social_ver INTEGER NOT NULL, request_seen_ver INTEGER NOT NULL, settings TEXT NOT NULL, official INTEGER NOT NULL, loaded INTEGER NOT NULL)")
+            db.execute("CREATE TABLE friends(user_id TEXT PRIMARY KEY, ver INTEGER NOT NULL, json TEXT NOT NULL)")
+            db.execute("CREATE TABLE friend_requests(user_id TEXT NOT NULL, direction TEXT NOT NULL, ver INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY(user_id, direction))")
+            db.execute("CREATE TABLE blocks(user_id TEXT PRIMARY KEY, ver INTEGER NOT NULL, json TEXT NOT NULL)")
+            db.execute("CREATE TABLE attachments(client_msg_id TEXT PRIMARY KEY, conv_id TEXT NOT NULL, json TEXT NOT NULL)")
+            db.execute("CREATE TABLE mod_vers(conv_id TEXT PRIMARY KEY, mod_ver INTEGER NOT NULL)")
+            db.execute("PRAGMA user_version = 3")
+            db.execute("INSERT INTO meta(key, value) VALUES('owner', 'alice')")
+            for (g in listOf("g1", "g2")) {
+                db.execute(
+                    "INSERT INTO conversations(conv_id, read_base, placeholder, json) VALUES(?, 2, 0, ?)",
+                    listOf("group:$g", """{"convId":"group:$g","type":"group","name":"$g","maxSeq":2,"readSeq":2,"minSeq":1,"unread":0,"updatedAt":2}"""),
+                )
+                for (seq in 1..2) {
+                    db.execute(
+                        "INSERT INTO messages(conv_id, row_key, seq, json) VALUES(?, ?, ?, ?)",
+                        listOf("group:$g", "s$seq", seq.toLong(), """{"clientMsgId":"$g-$seq","msgId":"$g-$seq","seq":$seq,"convId":"group:$g","from":"bob","type":"text","body":{"text":"$s2 $g $seq"},"ts":$seq,"status":"SENT"}"""),
+                    )
+                }
+            }
+        }
+        val e = Env(file)
+        assertEquals(listOf(1L, 2L), e.im.messages("group:g1").map { it.seq })
+        e.im.connect("t")
+        e.scheduler.runCurrent()
+        val c = e.transport.current
+        c.open()
+        c.ack("auth", Json.parseToJsonElement("""{"userId":"alice","serverTime":1}"""))
+        // g1 被我在别的设备上删除（deleted 里，不是"你已不在该群"）；g2 还在列表里，之后另一台设备删除它。
+        c.ack(
+            "convs",
+            Json.parseToJsonElement("""{"convs":[{"convId":"group:g2","type":"group","name":"g2","maxSeq":2,"readSeq":2,"minSeq":1,"unread":0,"lastMsg":null,"updatedAt":2,"memberCount":3,"myRole":"member","modVer":0,"pinned":true,"pinnedAt":5}],"truncated":false,"deleted":[{"convId":"group:g1","clearedSeq":2}]}"""),
+        )
+        assertEquals(listOf("group:g2"), e.im.conversations.value.map { it.convId })
+        assertEquals(emptyList(), e.im.messages("group:g1"))
+        assertEquals(emptyList(), filesContaining(dir, "$s2 g1"))
+        assertTrue(filesContaining(dir, "$s2 g2").isNotEmpty(), "对照：g2 还没删")
+        c.receive("""{"cmd":"event","data":{"type":"convDeleted","convId":"group:g2","clearedSeq":2}}""")
+        assertEquals(emptyList(), e.im.conversations.value)
+        assertEquals(emptyList(), filesContaining(dir, s2))
+        assertEquals(emptyList(), dir.listFiles()!!.map { it.name }.filter { it.endsWith("-wal") })
+        e.close()
+        assertEquals(emptyList(), filesContaining(dir, s2))
+        AndroidLocalDatabase.open(file).use { db ->
+            assertEquals(4L, db.query("PRAGMA user_version").single().values.single())
+            assertEquals(setOf("group:g1", "group:g2"), db.query("SELECT conv_id FROM cleared_convs").map { it["conv_id"] }.toSet())
+        }
+        val e2 = Env(file)
+        assertEquals(emptyList(), e2.im.conversations.value)
+        assertEquals(emptyList(), e2.im.messages("group:g2"))
+        e2.close()
     }
 
     @Test
