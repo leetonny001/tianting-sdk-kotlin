@@ -24,12 +24,16 @@ private fun categorize(code: Int): ErrorCategory = when (code / 10) {
     else -> if (code >= 5000) ErrorCategory.SERVER else ErrorCategory.BAD_REQUEST
 }
 
-/** 服务端返回的错误（ack.error）。userId：建群失败时是哪个人（error.userId，兼容 details.userId）。details 原样透传。 */
+/**
+ * 服务端返回的错误（ack.error）。userId：建群失败时是哪个人（error.userId，兼容 details.userId）。details 原样透传。
+ * reason：细分同一个错误码（4040 的 quoteUnavailable、4030 的 mentionAllForbidden，errors.json 的 reasons）。
+ */
 public open class IMError(
     public val code: Int,
     message: String,
     public val userId: String? = null,
     public val details: JsonObject? = null,
+    public val reason: String? = null,
 ) : Exception("$code $message") {
     public val description: ErrorDescription get() = describeError(code)
 }
@@ -51,9 +55,17 @@ public class ProtocolDecodeError(cmd: String) : Exception("$cmd: malformed ack")
  * 这里只列与命令相关的码；没有列出的返回 null，界面用该码的默认文案。
  * strangerMsgLimit 填进 4137 的 N（取最近一次同步 / 事件中的值）；name 填进建群 / 邀请失败的 {name}。
  */
-public fun messageFor(cmd: String, code: Int, strangerMsgLimit: Int = 0, name: String = ""): String? {
+public fun messageFor(cmd: String, code: Int, strangerMsgLimit: Int = 0, name: String = "", windowSeconds: Long? = null): String? {
+    // 4097 按 details.windowSeconds 选时限（PRD-chat 第 11.5 节）：120 秒"2 分钟"，604800 秒"7 天"。
+    if (cmd == "recall" && code == ErrorCode.RECALL_WINDOW_EXPIRED) return "发送时间超过 ${windowText(windowSeconds ?: 120)}，无法撤回"
     val t = COPY["$cmd:$code"] ?: COPY["*:$code"] ?: return null
     return t.replace("{N}", strangerMsgLimit.toString()).replace("{name}", name)
+}
+
+private fun windowText(sec: Long): String = when {
+    sec >= 86_400 && sec % 86_400 == 0L -> "${sec / 86_400} 天"
+    sec >= 60 && sec % 60 == 0L -> "${sec / 60} 分钟"
+    else -> "$sec 秒"
 }
 
 private const val DAILY = "今天的次数已用完，明天再试"
@@ -64,6 +76,8 @@ private val COPY: Map<String, String> = mapOf(
     "send:4036" to "消息已发出，但被对方拒收了",
     "send:4137" to "对方回复之前，最多只能发送 {N} 条消息",
     "send:4292" to "今天发起新聊天的次数已用完，请稍后再试",
+    "send:4293" to "@所有人次数已用完",
+    "recall:4030" to "你没有权限撤回这条消息",
     "friendApply:4132" to "你的好友数量已达上限",
     "friendRespond:4132" to "你的好友数量已达上限",
     "friendRespond:4133" to "对方好友数量已达上限",

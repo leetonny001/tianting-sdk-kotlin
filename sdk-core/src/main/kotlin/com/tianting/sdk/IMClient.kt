@@ -9,6 +9,7 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.BufferOverflow
@@ -72,7 +73,24 @@ public sealed interface IMEvent {
 
     /** 某人的资料变了，读 displayName（F-ACC-06：自己改昵称后立即显示）。 */
     public data class ProfileChanged(val userId: String) : IMEvent
+
+    /**
+     * 正在下载的文件所在的消息被撤回（recalled = true，AC-RCL-03-12：提示"该消息已被撤回"）或被删除、过期（false）：
+     * 下载已中止、下了一半的文件已删除，download 抛 DownloadAbortedError。
+     */
+    public data class DownloadAborted(val fileId: String, val recalled: Boolean) : IMEvent
 }
+
+/** 下载中途所在的消息被撤回（recalled）或删除、过期：已中止，部分文件已删除（AC-RCL-03-12）。 */
+public class DownloadAbortedError(public val fileId: String, public val recalled: Boolean) :
+    Exception(if (recalled) "download aborted: message recalled" else "download aborted: file unavailable")
+
+/** 消息菜单里 SDK 判断的几项（F-UI-09 扩展，PRD-chat 第 13.3 节）。举报随 C6；失败消息的重发、删除由页面按 status 判断。 */
+public enum class MessageAction { COPY, QUOTE, RECALL }
+
+/** 撤回时限（PRD-chat F-RCL-01 规则 1、F-RCL-02 规则 2 的默认值）。服务端可以配置，不一致时以服务端的 4097 为准（问题 25）。 */
+public const val RECALL_WINDOW_MS: Long = 120_000L
+public const val GROUP_RECALL_WINDOW_MS: Long = 7 * 86_400_000L
 
 public sealed interface SendResult {
     public data class Ok(val message: Message) : SendResult
@@ -147,6 +165,8 @@ private val SECURITY_NOTICE_KINDS = setOf(
     "newDeviceLogin", "passwordChanged", "passwordRecovered", "recoveryCodeRegenerated", "refreshReplay", "refreshRateLimited", "newIpPrefix",
 )
 private const val MAX_SAFE_INTEGER = 9007199254740991L
+/** 提及计数的刷新节流（F-MEN-03 规则 1，未校准）：5 秒内最多拉一次 convs，窗口内的事件在窗口结束时补拉一次。 */
+private const val MENTION_REFRESH_MS = 5_000L
 private const val URL_REUSE_MARGIN_MS = 15_000L // 地址剩余不到这么久就不再复用，重新申请（下载要时间） // 打开未知会话时的 beforeSeq，与 sdk-ts 相同
 
 /**
@@ -217,6 +237,14 @@ public class IMClient(private val o: IMClientOptions) {
     private val urlWaiting = HashMap<String, CompletableDeferred<FileUrlResult>>()
     private val urlQueue = ArrayList<FileUrlItem>()
     private var urlFlushScheduled = false
+    private var mentionFetchAt = Long.MIN_VALUE / 2
+    private var mentionTimer: Timer? = null
+
+    // 正在下载的文件：fileId → 这些下载的中止开关（撤回、删除、过期时中止，AC-RCL-03-12）。
+    private class Download(val job: Job) {
+        var abortedRecalled: Boolean? = null
+    }
+    private val downloads = HashMap<String, MutableSet<Download>>()
 
     private class Source(var rec: AttachmentRecord, var produce: (suspend () -> ProcessedImage)?, var onProgress: UploadProgress?)
 
@@ -440,19 +468,25 @@ public class IMClient(private val o: IMClientOptions) {
      * 发送文本。先在本地插入一条"发送中"（离线时"排队"）的消息，ack 后更新为已发送。
      * 文本为空或超过 5000 字时不发送，返回原因。还不知道自己是谁（没连接成功过，本地库也没有）时抛 NotConnectedError；
      * 会话 ID 不合法时抛 IllegalArgumentException。
+     * C4（PRD-chat 第 13.1 节）：quote 引用一条已发送的消息（F-QUO-01），上行只发 msgId，本地待发的消息用已加载的原消息先拼出引用条；
+     * mentions 是 @ 的人（F-MEN-01、02），只在群聊，单聊带了抛 IllegalArgumentException；userIds 去重，全空且没有 all 时不带。
+     * 正文里的 "@昵称 " 由 App 插入（用资料昵称，不用备注，R-CF-03）。4040（errorReason=quoteUnavailable）、4293（@ 所有人次数用完）、
+     * 4131 和其他错误码一样标记失败，不自动重发。
      */
-    public suspend fun send(convId: String, text: String): SendResult = onSdk {
+    public suspend fun send(convId: String, text: String, quote: QuoteRef? = null, mentions: Mentions? = null): SendResult = onSdk {
         when (val check = checkText(text)) {
             is TextCheck.Rejected -> SendResult.Rejected(check.reason, check.over)
             is TextCheck.Ok -> {
                 if (self.isEmpty()) throw NotConnectedError()
-                parseConvId(convId, self) // 不合法的会话 ID 在这里抛出，不能留下一条永远"发送中"的消息
+                val parsed = parseConvId(convId, self) // 不合法的会话 ID 在这里抛出，不能留下一条永远"发送中"的消息
+                val men = normalizeMentions(mentions)
+                require(men == null || parsed.convType == ConvType.GROUP) { "mentions are only allowed in group conversations" }
                 val msg = Message(
                     clientMsgId = o.newId(),
                     convId = convId,
                     from = self,
                     type = MsgType.TEXT,
-                    body = MsgBody(text = check.text),
+                    body = MsgBody(text = check.text, quote = quote?.let { localQuote(convId, it.msgId) }, mentions = men),
                     ts = clock.now(),
                     status = if (conn.state == ConnState.CONNECTED) MessageStatus.SENDING else MessageStatus.QUEUED,
                 )
@@ -462,6 +496,91 @@ public class IMClient(private val o: IMClientOptions) {
                 SendResult.Ok(msg)
             }
         }
+    }
+
+    /** 本地待发消息里的引用条：被引用的消息已加载时按服务端同样的规则拼摘要（F-QUO-02 规则 2），否则只有 msgId。 */
+    private fun localQuote(convId: String, msgId: String): QuoteView {
+        val m = store.listIfExists(convId)?.findByMsgId(msgId) ?: return QuoteView(msgId, state = QuoteState.NORMAL)
+        val base = QuoteView(msgId, m.seq, m.from, m.type, QuoteState.NORMAL)
+        return when {
+            m.deleted -> base.copy(state = if (m.recalled) QuoteState.RECALLED else QuoteState.DELETED)
+            else -> base.copy(text = quoteSummary(m))
+        }
+    }
+
+    // ---- 撤回（FE-661，PRD-chat F-RCL-01～03） ----
+
+    /**
+     * 撤回（PRD-chat F-RCL-01、02，第 13.1 节）。成功后本地立即按撤回处理：清除原文、引用它的原文、本地库和文件缓存
+     * （服务端不给发起撤回的这条连接发 msgDeleted，只回 ack，问题 27）。失败抛 IMError，不自动重试（问题 26）：
+     * 4097 带 details.windowSeconds（messageFor("recall", 4097, windowSeconds = …) 给文案）；4030 是没有权限
+     * （"你没有权限撤回这条消息"，AC-RCL-02-5）；4044 消息不存在或已被后台删除。重复撤回是幂等成功。
+     */
+    public suspend fun recall(convId: String, msgId: String): Unit = onSdk {
+        if (self.isEmpty()) throw NotConnectedError()
+        reqRaw(
+            "recall",
+            buildJsonObject {
+                put("convId", convId)
+                put("msgId", msgId)
+            },
+        )
+        val seq = store.listIfExists(convId)?.findByMsgId(msgId)?.seq
+        applyDeleted(convId, listOf(msgId), listOfNotNull(seq), RecallInfo(self, serverNow()))
+    }
+
+    /**
+     * 这条消息现在能不能撤回（菜单里显示"撤回"，AC-RCL-01-8）：按消息 ts 和 auth ack 校正后的服务端时间判断，不用设备时钟。
+     * 自己的消息 2 分钟内；群主、管理员撤回自己的取更宽的 7 天；群主 7 天内任何人的；管理员 7 天内别人的
+     * （对方是管理员或群主时服务端回 4030，客户端不知道对方角色，F-RCL-02 规则 1b）。
+     * 只有已发送的 text、image、file；撤回、删除的消息和提示行不能。myRole 为 null 时用会话列表里的角色。可以从任意线程调。
+     */
+    public fun canRecall(m: Message, myRole: GroupRole? = null): Boolean {
+        if (m.status != MessageStatus.SENT || m.msgId == null || m.deleted) return false
+        if (m.type != MsgType.TEXT && m.type != MsgType.IMAGE && m.type != MsgType.FILE) return false
+        val group = m.convId.startsWith("group:")
+        val role = if (group) myRole ?: _conversations.value.firstOrNull { it.convId == m.convId }?.myRole else null
+        val manager = role == GroupRole.OWNER || role == GroupRole.ADMIN
+        val window = when {
+            m.from == self -> if (manager) maxOf(RECALL_WINDOW_MS, GROUP_RECALL_WINDOW_MS) else RECALL_WINDOW_MS
+            group && manager -> GROUP_RECALL_WINDOW_MS
+            else -> return false
+        }
+        return serverNow() - m.ts <= window
+    }
+
+    /**
+     * 长按菜单里由 SDK 判断的项（F-RCL-03 规则 6）：撤回、删除的消息和提示行没有菜单（空列表，AC-RCL-03-10）。
+     * 复制只有文本；引用要已发送的 text、image、file（F-QUO-01 规则 5）；撤回按 canRecall。
+     * 服务端关了 msgActions（GET /v1/config 的 features）时页面只留"复制"。可以从任意线程调。
+     */
+    public fun messageActions(m: Message, myRole: GroupRole? = null): List<MessageAction> {
+        if (m.deleted || m.type == MsgType.TIP) return emptyList()
+        val out = ArrayList<MessageAction>()
+        if (m.type == MsgType.TEXT) out.add(MessageAction.COPY)
+        if (m.status == MessageStatus.SENT && m.msgId != null && (m.type == MsgType.TEXT || m.type == MsgType.IMAGE || m.type == MsgType.FILE)) {
+            out.add(MessageAction.QUOTE)
+        }
+        if (canRecall(m, myRole)) out.add(MessageAction.RECALL)
+        return out
+    }
+
+    /**
+     * 撤回文案要的判断数据（F-RCL-02 规则 1a，聊天页和列表摘要同一张表）：单聊 / 群、操作者是不是自己、被撤回的是不是自己的。
+     * 不是撤回的返回 null（后台删除显示"该消息已被删除"）。可以从任意线程调。
+     */
+    public fun recallNotice(m: Message): RecallNotice? = recallNoticeOf(m.convId, m, self)
+
+    /** 会话摘要的撤回文案数据（lastMsg）。 */
+    public fun recallNotice(convId: String, last: LastMsg): RecallNotice? = recallNoticeOf(convId, last, self)
+
+    /** 撤回文案（F-RCL-02 规则 1a 的表）：显示名按 displayName（备注只在本地显示，问题 19）。不是撤回的返回 null。 */
+    public suspend fun recallText(m: Message): String? = onSdk {
+        recallNotice(m)?.let { n -> com.tianting.sdk.recallText(n) { u -> displayNameNow(u) } }
+    }
+
+    public suspend fun recallText(convId: String, last: LastMsg): String? = onSdk {
+        recallNotice(convId, last)?.let { n -> com.tianting.sdk.recallText(n) { u -> displayNameNow(u) } }
     }
 
     /**
@@ -622,7 +741,23 @@ public class IMClient(private val o: IMClientOptions) {
             withContext(io) { dir.mkdirs() }
             val tmp = java.io.File(dir, dest.name + ".part" + o.newId().filter { it.isLetterOrDigit() }.take(12))
             try {
-                f.get(url, tmp) { onProgress?.invoke(it) }
+                var d: Download? = null
+                try {
+                    // 传输放在子协程里：所在消息被撤回、删除时只中止它（forgetFiles），调用方的协程不受影响。
+                    kotlinx.coroutines.coroutineScope {
+                        val transfer = async { f.get(url, tmp) { onProgress?.invoke(it) } }
+                        d = Download(transfer).also { downloads.getOrPut(fileId) { HashSet() }.add(it) }
+                        transfer.await()
+                    }
+                } catch (e: CancellationException) {
+                    val r = d?.abortedRecalled ?: throw e
+                    throw DownloadAbortedError(fileId, r) // 调用方自己没有取消
+                } finally {
+                    downloads[fileId]?.let { set ->
+                        set.remove(d)
+                        if (set.isEmpty()) downloads.remove(fileId)
+                    }
+                }
                 if (store.fileExpired(fileId)) throw IMError(4048, "file unavailable")
                 withContext(io) { check(tmp.renameTo(dest) || (tmp.copyTo(dest, true).exists() && tmp.delete())) }
                 return@onSdk dest
@@ -919,9 +1054,17 @@ public class IMClient(private val o: IMClientOptions) {
         return java.io.File(dir, "f-${h.take(40)}-${variant.wire}")
     }
 
-    /** 过期或被删的文件：丢掉地址和下载缓存，通知 App（AC-FILE-06-12）。 */
-    private fun forgetFiles(ids: List<String>) {
+    /** 过期或被删（含撤回）的文件：中止进行中的下载，丢掉地址和下载缓存，通知 App（AC-FILE-06-12、AC-RCL-03-12）。 */
+    private fun forgetFiles(ids: List<String>, recalled: Set<String> = emptySet()) {
         if (ids.isEmpty()) return
+        for (id in ids) {
+            val running = downloads.remove(id) ?: continue
+            for (d in running) {
+                d.abortedRecalled = id in recalled
+                d.job.cancel()
+            }
+            emit(IMEvent.DownloadAborted(id, id in recalled))
+        }
         for (id in ids) for (v in FileVariant.entries) urlCache.remove(urlKey(FileUrlItem(id, v)))
         o.fileCacheDir?.let { dir ->
             val targets = ids.flatMap { id -> FileVariant.entries.map { cacheFile(dir, id, it) } }
@@ -1068,10 +1211,12 @@ public class IMClient(private val o: IMClientOptions) {
     public suspend fun profileOf(userId: String): UserProfile? = onSdk { profiles.last(userId) }
 
     /** 显示名：好友备注 → 昵称 → userId（备注只在本机显示，PRD-social 5.5 节）。 */
-    public suspend fun displayName(userId: String): String = onSdk {
+    public suspend fun displayName(userId: String): String = onSdk { displayNameNow(userId) }
+
+    private fun displayNameNow(userId: String): String {
         val f = social.friends[userId]
-        if (f != null && !f.deleted && f.remark.isNotEmpty()) return@onSdk f.remark
-        profiles.last(userId)?.nickname?.takeIf { it.isNotEmpty() } ?: userId
+        if (f != null && !f.deleted && f.remark.isNotEmpty()) return f.remark
+        return profiles.last(userId)?.nickname?.takeIf { it.isNotEmpty() } ?: userId
     }
 
     public suspend fun applyFriend(userId: String, options: ApplyFriendOptions = ApplyFriendOptions()): RequestStatus = onSdk {
@@ -1351,6 +1496,24 @@ public class IMClient(private val o: IMClientOptions) {
             "groupMembers",
             buildJsonObject {
                 put("groupId", groupId)
+                if (!cursor.isNullOrEmpty()) put("cursor", cursor)
+            },
+            GroupMembersPage.serializer(),
+        )
+        page.members.forEach { profiles.put(UserProfile(it.userId, it.nickname, it.avatar, it.official)) }
+        page
+    }
+
+    /**
+     * 搜索群成员（@ 选人，PRD-chat F-MEN-01 规则 6）：keyword 是 userId 前缀（区分大小写）或昵称前缀（ASCII 不区分大小写），
+     * 空串等于不搜索。每人每分钟 30 次（4290），不自动重试，抛 IMError 给页面。资料写进缓存。
+     */
+    public suspend fun searchGroupMembers(groupId: String, keyword: String, cursor: String? = null): GroupMembersPage = onSdk {
+        val page = req(
+            "groupMembers",
+            buildJsonObject {
+                put("groupId", groupId)
+                if (keyword.isNotEmpty()) put("keyword", keyword)
                 if (!cursor.isNullOrEmpty()) put("cursor", cursor)
             },
             GroupMembersPage.serializer(),
@@ -1657,16 +1820,18 @@ public class IMClient(private val o: IMClientOptions) {
             "readUpdated" -> {
                 val convId = string(ev, "convId") ?: return
                 val seq = (ev["readSeq"] as? JsonPrimitive)?.longOrNull ?: return
-                var changed = false
-                changed = store.advanceRead(convId, seq)
-                if (changed) emitConversations()
+                // 另一端已读：提及数本地推算不了（不知道已读位置前后各有几条提及），有提及时重新拉 convs（F-MEN-03 规则 1）。
+                if (hasMentions(convId)) refreshMentions()
+                if (store.advanceRead(convId, seq)) emitConversations()
             }
             "groupChanged" -> onGroupChanged(string(ev, "groupId") ?: return)
             "msgDeleted" -> {
                 val convId = string(ev, "convId") ?: return
                 val ids = (ev["msgIds"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull } ?: emptyList()
                 val seqs = (ev["seqs"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.longOrNull } ?: emptyList()
-                onMsgDeleted(convId, ids, seqs)
+                val r = ev["recalled"] as? JsonObject
+                val recall = r?.let { RecallInfo(string(it, "by") ?: "", (it["at"] as? JsonPrimitive)?.takeIf { p -> !p.isString }?.longOrNull) }
+                onMsgDeleted(convId, ids, seqs, recall)
             }
             "muted" -> applyMute(string(ev, "scope"), string(ev, "groupId"), deadlineOf(ev, "mutedUntil") ?: return)
             "unmuted" -> applyMute(string(ev, "scope"), string(ev, "groupId"), Deadline.Absent)
@@ -1694,15 +1859,16 @@ public class IMClient(private val o: IMClientOptions) {
     }
 
     /**
-     * 消息被删除（PRD-admin F-ADM-31）：清除内存和本地库里的原文，摘要改成占位，未读不变。
+     * 消息被删除（PRD-admin F-ADM-31）或撤回（recall 不为 null，PRD-chat F-RCL-03 规则 1）：清除内存和本地库里的原文和引用它的原文，
+     * 摘要改成占位，未读不变；文件的地址、下载缓存清掉，通过 FilesExpired 让 App 丢掉缓存（规则 3）。
+     * 这个会话有提及我的未读时重新拉 convs（F-MEN-03 规则 1）。
      * 还有没拿到 ack 的本地消息时（超时标记失败、ack 丢了），被删的可能正是其中一条：事件里只有 msgId 和 seq，
      * 要向服务端补拉才能按 clientMsgId 对上，并清掉发送队列里的那份原文。
      */
-    private fun onMsgDeleted(convId: String, msgIds: List<String>, seqs: List<Long>) {
-        var changed = false
-        store.transaction { changed = store.deleteMessages(convId, msgIds, seqs) }
-        if (changed) emitMessages(convId)
-        emitConversations()
+    private fun onMsgDeleted(convId: String, msgIds: List<String>, seqs: List<Long>, recall: RecallInfo? = null) {
+        val mentioned = hasMentions(convId)
+        applyDeleted(convId, msgIds, seqs, recall)
+        if (mentioned) refreshMentions()
         val list = store.list(convId)
         val top = seqs.maxOrNull() ?: 0
         val localMax = store.maxSeq(convId)
@@ -1717,6 +1883,49 @@ public class IMClient(private val o: IMClientOptions) {
                 log.warn("im: deleted sync failed: ${safeDescribe(e)}")
             }
         }
+    }
+
+    private fun applyDeleted(convId: String, msgIds: List<String>, seqs: List<Long>, recall: RecallInfo?) {
+        var changed = false
+        store.transaction { changed = store.deleteMessages(convId, msgIds, seqs, recall) }
+        if (changed) emitMessages(convId)
+        emitConversations()
+    }
+
+    private fun hasMentions(convId: String): Boolean = (store.conversation(convId)?.mentionUnread ?: 0) > 0
+
+    /** 按节流重新拉 convs 更新提及数（F-MEN-03 规则 1，R-CF-18）：窗口外立即拉；窗口内只记一次，窗口结束（上次拉取后 5 秒）时补拉。 */
+    private fun refreshMentions() {
+        if (mentionTimer != null) return
+        val wait = mentionFetchAt + MENTION_REFRESH_MS - clock.now()
+        if (wait <= 0) {
+            fetchMentions()
+            return
+        }
+        mentionTimer = clock.schedule(wait) {
+            mentionTimer = null
+            fetchMentions()
+        }
+    }
+
+    private fun fetchMentions() {
+        if (conn.state != ConnState.CONNECTED) return // 重连时的 convs 会带最新的计数
+        mentionFetchAt = clock.now()
+        launchNow {
+            try {
+                applyConvs(req("convs", JsonObject(emptyMap()), ConvsAck.serializer()))
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                log.warn("im: mention refresh failed: ${safeDescribe(e)}")
+            }
+        }
+    }
+
+    /** 群消息 @ 了我或所有人（自己发的不算，F-MEN-03 规则 6）。 */
+    private fun mentionsMe(m: ServerMessage): Boolean {
+        val men = m.body?.mentions ?: return false
+        if (m.deleted || m.from == self || !m.convId.startsWith("group:")) return false
+        return men.all || self in men.userIds
     }
 
     /** 更新禁言表；不认识的 scope 忽略（协议 README 第 3 节规则 9）。until = Absent 表示解除。 */
@@ -1786,7 +1995,10 @@ public class IMClient(private val o: IMClientOptions) {
     private fun onMessage(m: ServerMessage) {
         val prev = store.maxSeq(m.convId)
         var fresh = false
-        store.transaction { fresh = store.applyServerMessage(m) }
+        store.transaction {
+            fresh = store.applyServerMessage(m)
+            if (fresh && mentionsMe(m)) store.bumpMention(m.convId, m.seq)
+        }
         if (!fresh) return
         emitMessages(m.convId)
         // 提示消息的摘要：本地按服务端同样的规则（只用昵称，F-SOC-29 规则 6）生成，下次 convs 时被权威文本覆盖。
@@ -1830,7 +2042,8 @@ public class IMClient(private val o: IMClientOptions) {
                 // 还没加载过消息的会话：之后加载到的就是这个版本以后的内容，记下作为基线。已加载的等重拉成功再更新。
                 if (c.modVer != null && !store.isLoaded(c.convId) && modVers[c.convId] != c.modVer) setModVer(c.convId, c.modVer)
                 // 错过了 msgDeleted 的话，摘要是唯一的线索：本地已加载的那条也要清掉。
-                if (c.lastMsg?.deleted == true && store.deleteMessages(c.convId, listOf(c.lastMsg.msgId), emptyList())) {
+                val recall = c.lastMsg?.takeIf { it.recalled }?.let { RecallInfo(it.recalledBy ?: "") }
+                if (c.lastMsg?.deleted == true && store.deleteMessages(c.convId, listOf(c.lastMsg.msgId), emptyList(), recall)) {
                     emitMessages(c.convId)
                 }
             }
@@ -1929,11 +2142,12 @@ public class IMClient(private val o: IMClientOptions) {
             put("type", msg.type.wire)
             // 附件只发 fileId，其他字段由服务端按记录填写（F-FILE-02 规则 1）。
             val wire = when (type) {
-                MsgType.IMAGE -> MsgBody(image = ImageBody(msg.body.image?.fileId ?: ""))
-                MsgType.FILE -> MsgBody(file = FileBody(msg.body.file?.fileId ?: ""))
-                else -> msg.body
+                MsgType.IMAGE -> ImJson.encodeToJsonElement(MsgBody.serializer(), MsgBody(image = ImageBody(msg.body.image?.fileId ?: "")))
+                MsgType.FILE -> ImJson.encodeToJsonElement(MsgBody.serializer(), MsgBody(file = FileBody(msg.body.file?.fileId ?: "")))
+                MsgType.TEXT -> textWire(msg.body)
+                else -> ImJson.encodeToJsonElement(MsgBody.serializer(), msg.body)
             }
-            put("body", ImJson.encodeToJsonElement(MsgBody.serializer(), wire))
+            put("body", wire)
         }
         launchNow {
             try {
@@ -1962,7 +2176,7 @@ public class IMClient(private val o: IMClientOptions) {
                     return@launchNow
                 }
                 when {
-                    e is IMError -> fail(convId, clientMsgId, SendError.Code(e.code))
+                    e is IMError -> fail(convId, clientMsgId, SendError.Code(e.code), e.reason)
                     e is TimeoutError -> fail(convId, clientMsgId, SendError.Timeout)
                     (e is ConnectionClosedError || e is NotConnectedError) && clientMsgId !in autoUsed -> {
                         // 发出后连接断了：重连后自动补发一次（PRD F-MSG-03 规则 2）。
@@ -1976,11 +2190,11 @@ public class IMClient(private val o: IMClientOptions) {
         }
     }
 
-    private fun fail(convId: String, clientMsgId: String, error: SendError) {
+    private fun fail(convId: String, clientMsgId: String, error: SendError, reason: String? = null) {
         val list = store.list(convId)
         val m = list.local(clientMsgId)
         if (m == null || m.status != MessageStatus.SENDING) return // 已经被晚到的 ack 更新为已发送
-        list.update(clientMsgId) { it.copy(status = MessageStatus.FAILED, error = error) }
+        list.update(clientMsgId) { it.copy(status = MessageStatus.FAILED, error = error, errorReason = reason) }
         emitMessages(convId)
         emit(IMEvent.SendFailed(convId, clientMsgId, error))
     }
@@ -2022,6 +2236,7 @@ public class IMClient(private val o: IMClientOptions) {
         }
         lastRead = clock.now()
         store.advanceRead(convId, latest)
+        store.clearMentions(convId)
         emitConversations()
         launchNow {
             try {
@@ -2065,7 +2280,8 @@ public class IMClient(private val o: IMClientOptions) {
         emitMessagesQuiet(convId)
         emit(IMEvent.MessagesChanged(convId, store.messages(convId)))
         emitPendingCount()
-        forgetFiles(store.takeExpiredFiles())
+        val recalled = store.takeRecalledFiles()
+        forgetFiles(store.takeExpiredFiles(), recalled)
     }
 
     private fun emitPendingCount() {
@@ -2080,6 +2296,9 @@ public class IMClient(private val o: IMClientOptions) {
         readTimer = null
         refreshTimer?.cancel()
         refreshTimer = null
+        mentionTimer?.cancel()
+        mentionTimer = null
+        mentionFetchAt = Long.MIN_VALUE / 2
         store = Store({ self }, local ?: NoStoreSink)
         mutes.clear()
         mutesChanged()

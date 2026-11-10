@@ -91,6 +91,41 @@ public data class FileBody(
     val expired: Boolean = false,
 )
 
+/**
+ * 引用的状态（PRD-chat F-QUO-02 规则 1）：NORMAL 带 text；RECALLED、DELETED、EXPIRED 没有原文。
+ * 将来可能有新的值：不认识的解码成 UNKNOWN，按"引用内容不可用"显示（quoteLabel）。
+ */
+@Serializable(with = QuoteStateSerializer::class)
+public enum class QuoteState(override val wire: String) : WireEnum {
+    NORMAL("normal"), RECALLED("recalled"), DELETED("deleted"), EXPIRED("expired"), UNKNOWN("unknown"),
+}
+
+internal object QuoteStateSerializer : WireEnumSerializer<QuoteState>("QuoteState", QuoteState.entries.toTypedArray(), QuoteState.UNKNOWN)
+
+/**
+ * 下行的引用（F-QUO-01 规则 3、F-QUO-02），服务端下发时组装。原消息已不存在时 state=DELETED，没有 seq、from、type。
+ * text 只在 state=NORMAL 时有：文本前 100 个码点；图片"[图片]"；文件"[文件] {文件名}"。引用文字不进日志（toString 不带它）。
+ * 上行只发 msgId（send 的 quote 参数），SDK 本地待发的消息用已加载的原消息先拼一份同样的结构。
+ */
+@Serializable
+public data class QuoteView(
+    val msgId: String,
+    val seq: Long? = null,
+    val from: String? = null,
+    val type: MsgType? = null,
+    val state: QuoteState = QuoteState.UNKNOWN,
+    val text: String? = null,
+) {
+    override fun toString(): String = "QuoteView(msgId=$msgId, seq=$seq, state=$state)"
+}
+
+/** @（F-MEN-01、02）：只在群聊、只有文本能带。下发的是服务端过滤后的结果。昵称不在这里（正文里的 "@昵称 " 由 App 插入）。 */
+@Serializable
+public data class Mentions(val userIds: List<String> = emptyList(), val all: Boolean = false)
+
+/** send 的引用参数（PRD-chat 第 13.1 节）：只给被引用消息的 msgId。 */
+public data class QuoteRef(val msgId: String)
+
 @Serializable
 public data class MsgBody(
     val text: String? = null,
@@ -98,6 +133,10 @@ public data class MsgBody(
     val tip: TipBody? = null,
     val image: ImageBody? = null,
     val file: FileBody? = null,
+    /** 引用（C4）。 */
+    val quote: QuoteView? = null,
+    /** @ 的人（C4）。 */
+    val mentions: Mentions? = null,
 ) {
     /** 图片或文件的 fileId；不是附件时为 null。 */
     val fileId: String? get() = image?.fileId ?: file?.fileId
@@ -117,11 +156,17 @@ internal data class ServerMessage(
     val type: MsgType,
     val body: MsgBody? = null,
     val ts: Long,
+    /** 没有正文：后台删除，或撤回（这时 recalled 也是 true，PRD-chat F-RCL-01 规则 5a）。 */
     val deleted: Boolean = false,
     val deletedAt: Long? = null,
+    /** 被撤回（C4）：只在为 true 时出现，同时 deleted=true、没有 body。 */
+    val recalled: Boolean = false,
+    val recalledAt: Long? = null,
+    /** 撤回的操作者：发送者本人，或群主、管理员。 */
+    val recalledBy: String? = null,
 )
 
-/** 会话摘要。最后一条消息被删除时没有 text（deleted = true）。 */
+/** 会话摘要。最后一条消息被删除时没有 text（deleted = true）；被撤回时同时 recalled = true、带 recalledBy（F-RCL-03 规则 4）。 */
 @Serializable
 public data class LastMsg(
     val msgId: String,
@@ -130,6 +175,8 @@ public data class LastMsg(
     val text: String? = null,
     val ts: Long,
     val deleted: Boolean = false,
+    val recalled: Boolean = false,
+    val recalledBy: String? = null,
 )
 
 /**
@@ -178,6 +225,10 @@ internal data class ServerConversation(
     val allMuted: Boolean = false,
     /** 已有消息展示内容的版本号（C2：文件过期），变化时重拉这个会话（F-RCL-03 规则 2）。老服务端没有。 */
     val modVer: Long? = null,
+    /** 未读中提及我的数量，含 @ 所有人（F-MEN-03 规则 1，C4）。开关关闭或老服务端没有这个字段。 */
+    val mentionUnread: Long? = null,
+    /** 未读里第一条提及我的 seq；mentionUnread=0 时没有。 */
+    val firstMentionSeq: Long? = null,
 )
 
 @Serializable
@@ -203,6 +254,8 @@ internal data class ErrorBody(
     val code: Int,
     val msg: String = "",
     val userId: String? = null,
+    /** 细分同一个错误码（4040 的 quoteUnavailable、4030 的 mentionAllForbidden 等，errors.json 的 reasons）。 */
+    val reason: String? = null,
     val details: JsonObject? = null,
 )
 

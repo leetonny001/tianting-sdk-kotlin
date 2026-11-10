@@ -47,13 +47,13 @@ im.close()                                         // 进程退出前：只释�
 | 类别 | 接口 |
 |---|---|
 | 状态流 | `state`、`banner`、`conversations`、`totalUnread`、`pendingCount`、`friends`、`friendRequests`、`blocks`、`socialSettings`、`socialLoaded`、`isOfficial`、`fatal`、`truncated`、`userId`、`messagesFlow(convId)`、`messages(convId)` |
-| 事件 | `events`：`MessagesChanged`、`SendFailed`、`ConvRemoved`、`MuteChanged`、`GroupChanged`、`Fatal` |
+| 事件 | `events`：`MessagesChanged`、`SendFailed`、`ConvRemoved`、`MuteChanged`、`GroupChanged`、`Fatal`、`FilesExpired`、`DownloadAborted`、`SecurityNotice`、`RecoveryCodeUnacked`、`ProfileChanged` |
 | 系统推送 | `pushes: Flow<Push>`、`pushSynced: Flow<Long>`、`pushCursor()`；选项 `pushStart`、`pushCursorStore`、`pushLimits`（见「系统推送」） |
 | 连接 | `connect`、`disconnect`、`close`、`networkOnline`、`visibilityChanged`、`serverNow` |
-| 消息 / 会话 | `send`、`retry`、`removeFailed`、`loadHistory`、`setActiveConversation`、`refreshConversations`、`conversationSnapshot`、`muteState`、`debugExport` |
+| 消息 / 会话 | `send`（可带 `quote`、`mentions`）、`recall`、`canRecall`、`messageActions`、`recallNotice`、`recallText`、`retry`、`removeFailed`、`loadHistory`、`setActiveConversation`、`refreshConversations`、`conversationSnapshot`、`muteState`、`debugExport` |
 | 社交 | `applyFriend`、`respondFriend`、`deleteFriend`、`setFriendRemark`、`markFriendRequestsSeen`、`relationOf`、`block`、`unblock`、`searchUser`、`setSearchable`、`getUsers`、`profileOf`、`displayName`、`loadMyGroups`、`refreshSocial` |
-| 群 | `createGroup`、`inviteToGroup`、`leaveGroup`、`kickFromGroup`、`transferGroupOwner`、`setGroupAdmin`、`dissolveGroup`、`updateGroup`、`getGroupInfo`、`loadGroupMembers` |
-| 工具 | `c2cConvId`、`groupConvId`、`parseConvIdStrict`、`peerId`、`checkText`、`trimText`、`countCodePoints`、`describeError`、`messageFor`、`tipText`、`ErrorCode`、`CloseCode`、`avatarColorIndex`、`avatarInitial`、`fnv1a32`、`pinyinGroup`、`groupByPinyin`、`compareNames` |
+| 群 | `createGroup`、`inviteToGroup`、`leaveGroup`、`kickFromGroup`、`transferGroupOwner`、`setGroupAdmin`、`dissolveGroup`、`updateGroup`、`getGroupInfo`、`loadGroupMembers`、`searchGroupMembers` |
+| 工具 | `c2cConvId`、`groupConvId`、`parseConvIdStrict`、`peerId`、`checkText`、`trimText`、`countCodePoints`、`describeError`、`messageFor`、`tipText`、`recallNoticeOf`、`recallText`、`quoteSummary`、`quoteLabel`、`ErrorCode`、`CloseCode`、`avatarColorIndex`、`avatarInitial`、`fnv1a32`、`pinyinGroup`、`groupByPinyin`、`compareNames` |
 | 测试替身 | `com.tianting.sdk.testing`：`FakeTransport`、`FakeConnection`、`FakeClock` |
 
 失败的命令抛 `IMError`（`code`、`userId`、`details` 透传）、`TimeoutError`、`NotConnectedError`、`ConnectionClosedError`、`ProtocolDecodeError`。
@@ -143,6 +143,32 @@ im.events.collect { if (it is IMEvent.FilesExpired) imageCache.remove(it.fileIds
 `Network`、`Process`、`Storage`、`SourceMissing`、`Timeout`、`Kicked`。`send` 返回 4096 时有沙盒副本的回到上传中重新上传（不算自动重发次数），没有的 `SourceMissing`；返回 4048 时，只有这台设备自己上传（`complete` 成功，记在 `attachments` 里，跨冷启动）的 `fileId` 同样处理，别人的 `fileId`（转发等）照常失败（PRD-chat v1.4 F-FILE-07 规则 4）。本地库第 2 版（加 `attachments`、`mod_vers` 表），第 1 版原地升级。
 重连时只重拉 `modVer` 变了的会话（服务端没有 `modVer` 时全部重拉），基线存本地库；`deleted`、`expired` 只能从假变真。
 预签名地址和文件名不进日志，地址不持久化；`OkHttpObjectTransport` 不装日志拦截器、不重试、不跟随重定向。
+
+## 撤回、引用、@（FE-661、FE-662，C4）
+
+语义和 sdk-ts 相同（tianting-server 的 `docs/sdk/README.md` C4 部分）。服务端开关 `IM_MSG_ACTIONS_ENABLED`，关闭时页面只留"复制"。
+
+```kotlin
+im.send(convId, "回复", quote = QuoteRef(m.msgId!!))                       // 上行只发 quote.msgId，待发气泡先拼好引用条
+im.send(groupConv, "@小王 看一下", mentions = Mentions(listOf("wang")))     // 只在群聊；单聊带 mentions 抛 IllegalArgumentException
+im.send(groupConv, "@所有人 开会", mentions = Mentions(all = true))
+im.messageActions(m)          // [COPY, QUOTE, RECALL] 的子集；撤回、删除的消息和提示行为空（可以在任意线程调）
+im.canRecall(m)               // 按 ts 和 auth ack 校正后的服务端时间：自己的 2 分钟，群主、管理员 7 天
+im.recall(convId, msgId)      // 成功后本地立即撤回；4097（details.windowSeconds）、4030、4044 抛 IMError，不自动重试
+im.recallText(m)              // "你撤回了一条消息" 等（F-RCL-02 规则 1a），列表摘要用 recallText(convId, lastMsg)
+quoteLabel(m.body.quote!!)    // 引用条文字：摘要 / 引用内容已被撤回 / 已被删除 / [图片] 已过期 / 引用内容不可用
+im.searchGroupMembers(groupId, keyword)  // @ 选人；4290 不自动重试
+```
+
+| 规则 | 说明 |
+|---|---|
+| 单调合并 | `deleted`、`recalled` 只能从假变真；`quote.state` 只能从 normal 往后走，`quote.text` 清除后不恢复；迟到的旧 sync、ack 带着原文也写不回来（F-RCL-03 规则 2a，`chat-sync.json`） |
+| 收到撤回 | `msgDeleted` 带 `recalled`：清除原文，本会话里引用它的消息（含待发的）的 `quote.text` 一起清掉、状态改 recalled（F-QUO-02 规则 4）；文件的地址和下载缓存清掉，发 `FilesExpired` |
+| 下载中被撤回 | 正在下载的文件所在消息被撤回或删除：中止下载、删掉部分文件，`download` 抛 `DownloadAbortedError`，发 `DownloadAborted(fileId, recalled)`；App 据此提示"该消息已被撤回"（AC-RCL-03-12） |
+| 本地库 | 第 3 版：`deleted_refs` 多一种 `kind='recalled'`（只知道 msgId、seq 的撤回，跨冷启动保留撤回者）。第 1、2 版原地升级，旧行保留；更新或不认识的版本按缓存重建。撤回、清引用后照样 `secure_delete` + checkpoint（不支持时 VACUUM），数据库文件里搜不到原文 |
+| 提及 | `Conversation.mentionUnread`、`firstMentionSeq`（服务端没给时为 null，不推算）。实时收到 @ 我 / @ 所有人（自己发的不算）本地 +1；本端读到最新清零；有提及的会话收到 `readUpdated`、`msgDeleted` 时节流 5 秒重拉 `convs` |
+| 失败 | 4040（`errorReason=quoteUnavailable`）、4293（"@所有人次数已用完"）、4131 标记失败，不自动重发。`IMError.reason` 是 ack 的 `error.reason` |
+| 日志 | 不打印引用文字、@ 的内容；`QuoteView.toString()` 不带 `text` |
 
 ## 开发
 

@@ -76,6 +76,8 @@ fun conv(
     allMuted: Boolean = false,
     mutedUntil: Any? = ABSENT,
     modVer: Long? = null,
+    mentionUnread: Long? = null,
+    firstMentionSeq: Long? = null,
 ): JsonObject {
     val m = linkedMapOf<String, Any?>(
         "convId" to convId,
@@ -93,6 +95,8 @@ fun conv(
     if (allMuted) m["allMuted"] = true
     if (mutedUntil != ABSENT) m["mutedUntil"] = mutedUntil
     modVer?.let { m["modVer"] = it }
+    mentionUnread?.let { m["mentionUnread"] = it }
+    firstMentionSeq?.let { m["firstMentionSeq"] = it }
     return js(m).jsonObject
 }
 

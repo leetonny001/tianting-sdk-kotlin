@@ -44,9 +44,9 @@ public class AccountError(
     public val status: Int,
     code: Int,
     msg: String,
-    public val reason: String? = null,
+    reason: String? = null,
     details: JsonObject? = null,
-) : IMError(code, msg, null, details)
+) : IMError(code, msg, null, details, reason)
 
 /** 没有拿到服务端的错误码：网络不通，或者响应不是约定的 JSON（例如代理返回的 HTML）。 */
 public open class AccountNetworkError(message: String = "network error") : Exception(message)

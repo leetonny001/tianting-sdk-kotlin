@@ -81,9 +81,14 @@ public data class Message(
     val error: SendError? = null,
     /** 错误码的 reason（例如 4290 的 uploadPendingLimit）。 */
     val errorReason: String? = null,
-    /** 被删除（PRD-admin F-ADM-31）：seq、msgId、发送者、时间都保留，body 为空。 */
+    /** 被删除（PRD-admin F-ADM-31）或撤回：seq、msgId、发送者、时间都保留，body 为空。 */
     val deleted: Boolean = false,
     val deletedAt: Long? = null,
+    /** 被撤回（PRD-chat F-RCL-01 规则 5a）：同时 deleted=true。文案用 recallNotice / recallText。 */
+    val recalled: Boolean = false,
+    val recalledAt: Long? = null,
+    /** 撤回的操作者；老服务端或本地推断不出来时为空。 */
+    val recalledBy: String? = null,
 )
 
 /** 界面看到的一个会话（不可变）。memberCount 缺失时为 null（界面只显示群名，不显示 0）。 */
@@ -102,7 +107,15 @@ public data class Conversation(
     val myRole: GroupRole? = null,
     /** 已有消息展示内容的版本号（F-RCL-03 规则 2）；老服务端没有。 */
     val modVer: Long? = null,
+    /** 未读中提及我的数量（F-MEN-03 规则 1）：大于 0 时列表摘要前缀"[有人@我]"。服务端没给时为 null。 */
+    val mentionUnread: Long? = null,
+    /** 未读里第一条提及我的 seq（"有人@我"跳转按钮）。 */
+    val firstMentionSeq: Long? = null,
 )
+
+/** 撤回的信息（msgDeleted 的 recalled，或 sync 下发的 recalled、recalledBy、recalledAt）。by 为空表示不知道是谁。 */
+@Serializable
+internal data class RecallInfo(val by: String, val at: Long? = null)
 
 /**
  * 被移出群后保留的会话快照（PRD-ui G-UI-21）：会话从列表里消失，但聊天页还能显示群名和"你已不在该群"。
@@ -126,6 +139,7 @@ internal interface StoreSink {
     fun clearServerMessages(convId: String)
     fun wipeMessage(m: Message)
     fun addDeletedRefs(convId: String, msgIds: Collection<String>, seqs: Collection<Long>)
+    fun addRecalledRefs(convId: String, msgIds: Map<String, RecallInfo>, seqs: Map<Long, RecallInfo>)
     fun addRemovedClient(convId: String, clientMsgIds: Collection<String>)
     fun addExpiredRefs(convId: String, msgIds: Collection<String>)
     fun <T> transaction(block: () -> T): T
@@ -140,6 +154,7 @@ internal object NoStoreSink : StoreSink {
     override fun clearServerMessages(convId: String) = Unit
     override fun wipeMessage(m: Message) = Unit
     override fun addDeletedRefs(convId: String, msgIds: Collection<String>, seqs: Collection<Long>) = Unit
+    override fun addRecalledRefs(convId: String, msgIds: Map<String, RecallInfo>, seqs: Map<Long, RecallInfo>) = Unit
     override fun addRemovedClient(convId: String, clientMsgIds: Collection<String>) = Unit
     override fun addExpiredRefs(convId: String, msgIds: Collection<String>) = Unit
     override fun <T> transaction(block: () -> T): T = block()
@@ -154,8 +169,17 @@ internal fun expireBody(body: MsgBody): MsgBody = when {
     else -> body
 }
 
-/** 被删除的最后一条消息的摘要：不保留原文。 */
-private fun deletedLast(msgId: String, from: String, type: MsgType, ts: Long) = LastMsg(msgId, from, type, null, ts, deleted = true)
+/** 被删除的最后一条消息的摘要：不保留原文。撤回时带 recalled、recalledBy（F-RCL-03 规则 4）。 */
+private fun deletedLast(msgId: String, from: String, type: MsgType, ts: Long, recall: RecallInfo? = null) =
+    LastMsg(msgId, from, type, null, ts, deleted = true, recalled = recall != null, recalledBy = recall?.by?.takeIf { it.isNotEmpty() })
+
+private fun recallOf(m: ServerMessage): RecallInfo? = if (m.recalled) RecallInfo(m.recalledBy ?: "", m.recalledAt) else null
+
+/** 引用清除原文（F-QUO-02 规则 4）：只留定位用的 msgId、seq、from、type 和新状态。 */
+private fun clearedQuote(q: QuoteView, state: QuoteState): QuoteView = q.copy(state = state, text = null)
+
+private fun withRecall(m: Message, r: RecallInfo): Message =
+    m.copy(recalled = true, recalledBy = r.by.takeIf { it.isNotEmpty() } ?: m.recalledBy, recalledAt = r.at ?: m.recalledAt)
 
 /** 一个会话的消息：有 seq 的按 seq 升序，没有 seq 的（待发 / 失败）按发送顺序排在最后（F-MSG-03 规则 3）。 */
 internal class MessageList(private val convId: String, private val self: () -> String, private val sinkOf: (String) -> StoreSink) {
@@ -167,6 +191,10 @@ internal class MessageList(private val convId: String, private val self: () -> S
     // 已知被删除的 msgId / seq：之后才到的 sync 结果、发送 ack 带着原文也不能写回来。
     private val deletedIds = HashSet<String>()
     private val deletedSeqs = HashSet<Long>()
+
+    // 其中已知是撤回的（F-RCL-03 规则 2a：recalled 只能从假变真，跨冷启动保留）和撤回信息。
+    private val recalledIds = HashMap<String, RecallInfo>()
+    private val recalledSeqs = HashMap<Long, RecallInfo>()
 
     // 已知文件已过期的 msgId（F-FILE-06 规则 3）：expired 只能从假变真，迟到的旧 sync 不能把它改回去（F-RCL-03 规则 2a）。
     private val expiredIds = HashSet<String>()
@@ -188,25 +216,35 @@ internal class MessageList(private val convId: String, private val self: () -> S
 
     /**
      * 合并服务端消息；按 msgId 去重，按 clientMsgId 合并本地待发消息。
-     * 已有的消息单调合并（F-RCL-03 规则 2a）：deleted、文件的 expired 只能从假变真，deletedIds 优先；
-     * 迟到的旧 sync 应答带着原文或 expired=false 时不回写。返回合并后的消息，没有变化时为 null。
+     * 已有的消息单调合并（F-RCL-03 规则 2a）：deleted、recalled、文件的 expired 只能从假变真，deletedIds 优先；
+     * quote.state 只能从 NORMAL 往后走，quote.text 清除后不恢复；迟到的旧 sync 应答带着原文、expired=false、
+     * deleted=false 或 quote.state=NORMAL 时不回写。返回合并后的消息，没有变化时为 null。
      */
     fun addServer(m: ServerMessage): Message? {
         if (m.clientMsgId in removedClient && m.from == self()) return null
         val deleted = m.deleted || isDeleted(m.msgId, m.seq)
+        val recall = recallOf(m) ?: recallOf(m.msgId, m.seq)
         if (m.msgId in byMsgId) {
-            val old = bySeq[m.seq]
-            if (old == null || old.deleted) return null
-            if (deleted) return wipe(old, m.deletedAt)
+            val old = bySeq[m.seq] ?: return null
+            if (old.deleted) {
+                // 已删除的只接受"后台删除 → 撤回"的补充信息（recalled 从假变真），正文不会回来。
+                if (recall == null || old.recalled) return null
+                return replace(old, withRecall(old, recall), wiped = true)
+            }
+            if (deleted) return wipe(old, m.deletedAt, recall)
+            var body = old.body
             if (m.body?.fileExpired == true && !old.body.fileExpired) {
                 markExpired(m.msgId, old.body)
-                val next = old.copy(body = expireBody(old.body))
-                bySeq[old.seq!!] = next
-                byClient[old.clientMsgId] = next
-                sink.upsertMessage(next)
-                return next
+                body = expireBody(body)
             }
-            return null
+            val q = old.body.quote
+            val nq = m.body?.quote
+            var cleared = false
+            if (q != null && q.state == QuoteState.NORMAL && nq != null && nq.state != QuoteState.NORMAL) {
+                body = body.copy(quote = clearedQuote(q, nq.state))
+                cleared = true
+            }
+            return if (body == old.body) null else replace(old, old.copy(body = body), wiped = cleared)
         }
         val local = byClient[m.clientMsgId]
         if (local != null && local.seq == null && local.from == m.from) {
@@ -218,6 +256,9 @@ internal class MessageList(private val convId: String, private val self: () -> S
             if (m.msgId !in expiredIds) markExpired(m.msgId, body)
             body = expireBody(body)
         }
+        // 引用的消息本地已知被撤回或删除：这份应答可能是撤回之前生成的，引用原文不能写进来（AC-RCL-03-13）。
+        val bq = body.quote
+        if (bq != null && bq.state == QuoteState.NORMAL) goneState(bq.msgId, bq.seq)?.let { body = body.copy(quote = clearedQuote(bq, it)) }
         val msg = Message(
             clientMsgId = m.clientMsgId,
             msgId = m.msgId,
@@ -230,7 +271,7 @@ internal class MessageList(private val convId: String, private val self: () -> S
             status = MessageStatus.SENT,
             deleted = deleted,
             deletedAt = if (deleted) m.deletedAt else null,
-        )
+        ).let { if (deleted && recall != null) withRecall(it, recall) else it }
         bySeq[m.seq] = msg
         byClient[m.clientMsgId] = msg
         byMsgId.add(m.msgId)
@@ -250,29 +291,84 @@ internal class MessageList(private val convId: String, private val self: () -> S
 
     fun isDeleted(msgId: String, seq: Long? = null): Boolean = msgId in deletedIds || (seq != null && seq in deletedSeqs)
 
-    /** 记下被删除的消息并清掉已加载的原文。返回是否有消息变了。 */
-    fun markDeleted(msgIds: Collection<String>, seqs: Collection<Long>): Boolean {
+    /** 本地已知的撤回信息（只有撤回的有，后台删除的没有）。 */
+    fun recallOf(msgId: String, seq: Long? = null): RecallInfo? = recalledIds[msgId] ?: seq?.let { recalledSeqs[it] }
+
+    /** 引用这条消息的 quote 应有的状态：已知撤回为 RECALLED，已知删除为 DELETED，其他为 null。 */
+    private fun goneState(msgId: String, seq: Long?): QuoteState? {
+        if (!isDeleted(msgId, seq)) return null
+        return if (recallOf(msgId, seq) != null) QuoteState.RECALLED else QuoteState.DELETED
+    }
+
+    /**
+     * 记下被删除（recall 不为 null 时是撤回）的消息并清掉已加载的原文；本会话里引用这几条的消息（含待发的）清除引用原文，
+     * 状态改成 RECALLED 或 DELETED（F-QUO-02 规则 4）。撤回信息只增不减：已经知道是撤回的，之后的后台删除不改回去。
+     * 返回是否有消息变了。
+     */
+    fun markDeleted(msgIds: Collection<String>, seqs: Collection<Long>, recall: RecallInfo? = null): Boolean {
         deletedIds.addAll(msgIds)
         deletedSeqs.addAll(seqs)
         sink.addDeletedRefs(convId, msgIds, seqs)
+        if (recall != null) {
+            val ids = msgIds.associateWith { recall }
+            val ss = seqs.associateWith { recall }
+            recalledIds.putAll(ids)
+            recalledSeqs.putAll(ss)
+            sink.addRecalledRefs(convId, ids, ss)
+        }
         var changed = false
         for (m in bySeq.values.toList()) {
-            if (!m.deleted && isDeleted(m.msgId ?: "", m.seq)) {
-                wipe(m, null)
+            if (!isDeleted(m.msgId ?: "", m.seq)) continue
+            val r = recallOf(m.msgId ?: "", m.seq)
+            if (!m.deleted) {
+                wipe(m, null, r)
+                changed = true
+            } else if (r != null && !m.recalled) {
+                replace(m, withRecall(m, r), wiped = true)
                 changed = true
             }
+        }
+        for (m in bySeq.values.toList() + unsent.toList()) {
+            val q = m.body.quote ?: continue
+            if (q.state != QuoteState.NORMAL) continue
+            val gone = goneState(q.msgId, q.seq) ?: continue
+            val body = m.body.copy(quote = clearedQuote(q, gone))
+            if (m.seq != null) {
+                replace(m, m.copy(body = body), wiped = true)
+            } else {
+                update(m.clientMsgId) { it.copy(body = body) }?.let { sink.wipeMessage(it) }
+            }
+            changed = true
         }
         return changed
     }
 
-    private fun wipe(old: Message, deletedAt: Long?): Message {
-        old.body.fileId?.takeIf { it.isNotEmpty() }?.let { newlyExpired.add(it) } // 文件的缓存同样要清（F-RCL-03 规则 3）
-        val next = old.copy(body = MsgBody(), deleted = true, deletedAt = deletedAt ?: old.deletedAt)
+    /** 按 msgId 找已加载的消息（引用、撤回用）。 */
+    fun findByMsgId(msgId: String): Message? {
+        if (msgId !in byMsgId) return null
+        return bySeq.values.firstOrNull { it.msgId == msgId }
+    }
+
+    private fun wipe(old: Message, deletedAt: Long?, recall: RecallInfo? = null): Message {
+        old.body.fileId?.takeIf { it.isNotEmpty() }?.let {
+            newlyExpired.add(it) // 文件的缓存同样要清（F-RCL-03 规则 3）
+            if (recall != null) newlyRecalled.add(it)
+        }
+        var next = old.copy(body = MsgBody(), deleted = true, deletedAt = deletedAt ?: old.deletedAt)
+        if (recall != null) next = withRecall(next, recall)
+        return replace(old, next, wiped = true)
+    }
+
+    /** 替换一条已有 seq 的消息。wiped：清除了原文（正文、引用），本地库要把旧内容从文件里清掉。 */
+    private fun replace(old: Message, next: Message, wiped: Boolean): Message {
         bySeq[old.seq!!] = next
         byClient[old.clientMsgId] = next
-        sink.wipeMessage(next)
+        if (wiped) sink.wipeMessage(next) else sink.upsertMessage(next)
         return next
     }
+
+    /** 这次合并里因撤回而失效的 fileId（newlyExpired 的子集，下载中的要中止并告诉 App 是撤回，AC-RCL-03-12）。 */
+    val newlyRecalled = LinkedHashSet<String>()
 
     /** 是否有还没有 seq 的本地消息（待发 / 失败），它们可能正是服务端已经存下的某一条。 */
     val hasUnsent: Boolean get() = unsent.isNotEmpty()
@@ -341,6 +437,7 @@ internal class MessageList(private val convId: String, private val self: () -> S
         for (m in bySeq.values) if (m.deleted) sink.wipeMessage(m) else sink.upsertMessage(m)
         for (m in unsent) sink.upsertMessage(m)
         sink.addDeletedRefs(convId, deletedIds, deletedSeqs)
+        sink.addRecalledRefs(convId, recalledIds, recalledSeqs)
         sink.addRemovedClient(convId, removedClient)
         sink.addExpiredRefs(convId, expiredIds)
     }
@@ -361,6 +458,8 @@ internal class MessageList(private val convId: String, private val self: () -> S
     fun restoreRefs(refs: DeletedRefs) {
         deletedIds.addAll(refs.ids)
         deletedSeqs.addAll(refs.seqs)
+        recalledIds.putAll(refs.recalledIds)
+        recalledSeqs.putAll(refs.recalledSeqs)
         removedClient.addAll(refs.removedClient)
         expiredIds.addAll(refs.expired)
     }
@@ -456,13 +555,17 @@ internal class Store(private val self: () -> String, private val sink: StoreSink
     }
 
     private fun fromServer(c: ServerConversation): ConvState {
-        val last = c.lastMsg
-        // 这份 convs 可能是删除之前生成的：已知被删除的消息不能把原文带回摘要。
-        val stale = last != null && !last.deleted && msgs[c.convId]?.isDeleted(last.msgId) == true
+        // 这份 convs 可能是删除之前生成的：已知被删除的消息不能把原文带回摘要；已知是撤回的，摘要也保持撤回（只能从假变真）。
+        var last = c.lastMsg
+        val list = msgs[c.convId]
+        if (last != null && list?.isDeleted(last.msgId) == true && (!last.deleted || !last.recalled)) {
+            val recall = list.recallOf(last.msgId)
+            if (!last.deleted || recall != null) last = deletedLast(last.msgId, last.from, last.type, last.ts, recall)
+        }
         val view = Conversation(
             c.convId, c.type, c.name, c.maxSeq, c.readSeq, c.minSeq, c.unread,
-            if (stale) deletedLast(last!!.msgId, last.from, last.type, last.ts) else last,
-            c.updatedAt, c.memberCount, c.myRole, c.modVer,
+            last,
+            c.updatedAt, c.memberCount, c.myRole, c.modVer, c.mentionUnread, c.firstMentionSeq,
         )
         // 同一内容保留原对象（G-UI-19）：500 个会话刷新一次，没变的引用不变。
         val old = convs[c.convId]?.view
@@ -475,6 +578,28 @@ internal class Store(private val self: () -> String, private val sink: StoreSink
         if (seq <= c.view.readSeq) return false
         c.view = c.view.copy(readSeq = seq)
         recount(c)
+        saveConv(c)
+        return true
+    }
+
+    /** 本端已读到最新：提及我的未读也清零（F-MEN-03 规则 1"已读前进后减少"），跳转按钮消失。 */
+    fun clearMentions(convId: String): Boolean {
+        val c = convs[convId] ?: return false
+        val v = c.view
+        if ((v.mentionUnread ?: 0) == 0L || v.readSeq < v.maxSeq) return false
+        c.view = v.copy(mentionUnread = 0, firstMentionSeq = null)
+        saveConv(c)
+        return true
+    }
+
+    /** 实时收到一条提及我的未读消息：本地先加 1，下次 convs 时以服务端为准（AC-MEN-01-1）。服务端没给过计数的会话不推算。 */
+    fun bumpMention(convId: String, seq: Long): Boolean {
+        val c = convs[convId] ?: return false
+        val v = c.view
+        val n = v.mentionUnread ?: return false
+        if (seq <= v.readSeq) return false
+        val first = v.firstMentionSeq
+        c.view = v.copy(mentionUnread = n + 1, firstMentionSeq = if (first == null || first == 0L || seq < first) seq else first)
         saveConv(c)
         return true
     }
@@ -509,19 +634,20 @@ internal class Store(private val self: () -> String, private val sink: StoreSink
         bumpMax(m.convId, m.seq)
         if (merged == null) return false
         val c = convs[m.convId] ?: newConversation(m)
+        val recall = if (merged.recalled) RecallInfo(merged.recalledBy ?: "") else null
+        val l = c.view.lastMsg
         if (m.seq > c.view.maxSeq) {
             c.view = c.view.copy(
                 maxSeq = m.seq,
                 lastMsg = if (merged.deleted) {
-                    deletedLast(m.msgId, m.from, m.type, m.ts)
+                    deletedLast(m.msgId, m.from, m.type, m.ts, recall)
                 } else {
                     LastMsg(m.msgId, m.from, m.type, takeCodePoints(merged.body.text ?: "", SUMMARY_LEN), m.ts)
                 },
                 updatedAt = maxOf(c.view.updatedAt, m.ts),
             )
-        } else if (merged.deleted && c.view.lastMsg?.msgId == m.msgId) {
-            val l = c.view.lastMsg!!
-            c.view = c.view.copy(lastMsg = deletedLast(l.msgId, l.from, l.type, l.ts))
+        } else if (merged.deleted && l?.msgId == m.msgId && (!l.deleted || (recall != null && !l.recalled))) {
+            c.view = c.view.copy(lastMsg = deletedLast(l.msgId, l.from, l.type, l.ts, recall))
         }
         if (m.from == self() && m.seq > c.view.readSeq) c.view = c.view.copy(readSeq = m.seq)
         recount(c)
@@ -530,18 +656,29 @@ internal class Store(private val self: () -> String, private val sink: StoreSink
     }
 
     /**
-     * 消息被删除（msgDeleted，或 convs 的 lastMsg.deleted）：清除原文，摘要改成占位。seq 不留空洞，未读不变（C-02）。
+     * 消息被删除或撤回（msgDeleted，或 convs 的 lastMsg.deleted）：清除原文和引用它的原文，摘要改成占位。
+     * seq 不留空洞，未读不变、updatedAt 不变（C-02，F-RCL-01 规则 6）。recall 不为 null 表示撤回。
      * 没加载过的消息也记下来，之后到的 sync 结果、发送 ack 不会把原文写回来。返回消息列表是否有变化。
      */
-    fun deleteMessages(convId: String, msgIds: Collection<String>, seqs: Collection<Long>): Boolean {
-        val changed = list(convId).markDeleted(msgIds, seqs)
+    fun deleteMessages(convId: String, msgIds: Collection<String>, seqs: Collection<Long>, recall: RecallInfo? = null): Boolean {
+        val changed = list(convId).markDeleted(msgIds, seqs, recall)
         val c = convs[convId]
         val l = c?.view?.lastMsg
-        if (c != null && l != null && !l.deleted && (l.msgId in msgIds || c.view.maxSeq in seqs)) {
-            c.view = c.view.copy(lastMsg = deletedLast(l.msgId, l.from, l.type, l.ts))
+        if (c != null && l != null && (l.msgId in msgIds || c.view.maxSeq in seqs) && (!l.deleted || (recall != null && !l.recalled))) {
+            c.view = c.view.copy(lastMsg = deletedLast(l.msgId, l.from, l.type, l.ts, recall))
             saveConv(c)
         }
         return changed
+    }
+
+    /** 取走因撤回而失效的 fileId（在 takeExpiredFiles 之前调用）。 */
+    fun takeRecalledFiles(): Set<String> {
+        val out = LinkedHashSet<String>()
+        for (l in msgs.values) {
+            out.addAll(l.newlyRecalled)
+            l.newlyRecalled.clear()
+        }
+        return out
     }
 
     /** 取走合并时刚变成过期（或被删除）的文件的 fileId：调用方清地址和文件缓存（F-FILE-06 规则 3、AC-FILE-06-12）。 */

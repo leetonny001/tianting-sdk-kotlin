@@ -344,7 +344,7 @@ internal class Connection(
         pending.remove(id)
         p.timer?.cancel()
         val err = errorBody?.let {
-            IMError(it.code, it.msg, it.userId ?: (it.details?.get("userId") as? JsonPrimitive)?.contentOrNull, it.details)
+            IMError(it.code, it.msg, it.userId ?: (it.details?.get("userId") as? JsonPrimitive)?.contentOrNull, it.details, it.reason)
         }
         if (p.timedOut) {
             p.onLateAck?.invoke(f["data"], err)

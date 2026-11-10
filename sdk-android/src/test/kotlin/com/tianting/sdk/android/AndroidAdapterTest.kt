@@ -103,6 +103,65 @@ class AndroidAdapterTest {
     }
 
     @Test
+    fun `FE-661：第 2 版的库在系统 SQLite 上原地升级到第 3 版（旧行保留）；撤回后数据库文件搜不到原文和引用原文，冷启动仍是撤回`() {
+        val dir = tmp.newFolder()
+        val file = File(dir, "im.db")
+        // 第 2 版的库（C2 的表结构），里面有一条含特征串的消息和引用它的消息。
+        AndroidLocalDatabase.open(file).use { db ->
+            db.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            db.execute("CREATE TABLE conversations(conv_id TEXT PRIMARY KEY, read_base INTEGER NOT NULL, placeholder INTEGER NOT NULL, json TEXT NOT NULL)")
+            db.execute("CREATE TABLE messages(conv_id TEXT NOT NULL, row_key TEXT NOT NULL, seq INTEGER, json TEXT NOT NULL, PRIMARY KEY(conv_id, row_key))")
+            db.execute("CREATE TABLE deleted_refs(conv_id TEXT NOT NULL, kind TEXT NOT NULL, ref TEXT NOT NULL, PRIMARY KEY(conv_id, kind, ref))")
+            db.execute("CREATE TABLE social_meta(id INTEGER PRIMARY KEY CHECK(id = 1), social_ver INTEGER NOT NULL, request_seen_ver INTEGER NOT NULL, settings TEXT NOT NULL, official INTEGER NOT NULL, loaded INTEGER NOT NULL)")
+            db.execute("CREATE TABLE friends(user_id TEXT PRIMARY KEY, ver INTEGER NOT NULL, json TEXT NOT NULL)")
+            db.execute("CREATE TABLE friend_requests(user_id TEXT NOT NULL, direction TEXT NOT NULL, ver INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY(user_id, direction))")
+            db.execute("CREATE TABLE blocks(user_id TEXT PRIMARY KEY, ver INTEGER NOT NULL, json TEXT NOT NULL)")
+            db.execute("CREATE TABLE attachments(client_msg_id TEXT PRIMARY KEY, conv_id TEXT NOT NULL, json TEXT NOT NULL)")
+            db.execute("CREATE TABLE mod_vers(conv_id TEXT PRIMARY KEY, mod_ver INTEGER NOT NULL)")
+            db.execute("PRAGMA user_version = 2")
+            db.execute("INSERT INTO meta(key, value) VALUES('owner', 'alice')")
+            db.execute(
+                "INSERT INTO conversations(conv_id, read_base, placeholder, json) VALUES('group:g1', 2, 0, ?)",
+                listOf("""{"convId":"group:g1","type":"group","name":"g","maxSeq":2,"readSeq":2,"minSeq":1,"unread":0,"updatedAt":2}"""),
+            )
+            db.execute(
+                "INSERT INTO messages(conv_id, row_key, seq, json) VALUES('group:g1', 's1', 1, ?)",
+                listOf("""{"clientMsgId":"c1","msgId":"g-1","seq":1,"convId":"group:g1","from":"bob","type":"text","body":{"text":"前缀 $secret"},"ts":1,"status":"SENT"}"""),
+            )
+            db.execute(
+                "INSERT INTO messages(conv_id, row_key, seq, json) VALUES('group:g1', 's2', 2, ?)",
+                listOf("""{"clientMsgId":"c2","msgId":"g-2","seq":2,"convId":"group:g1","from":"carol","type":"text","body":{"text":"回复","quote":{"msgId":"g-1","seq":1,"from":"bob","type":"text","state":"normal","text":"前缀 $secret"}},"ts":2,"status":"SENT"}"""),
+            )
+            db.execute("INSERT INTO deleted_refs(conv_id, kind, ref) VALUES('group:g1', 'client', 'gone')")
+        }
+        val e = Env(file)
+        assertEquals(listOf(1L, 2L), e.im.messages("group:g1").map { it.seq })
+        e.im.connect("t")
+        e.scheduler.runCurrent()
+        val c = e.transport.current
+        c.open()
+        c.ack("auth", Json.parseToJsonElement("""{"userId":"alice","serverTime":1}"""))
+        c.ack(
+            "convs",
+            Json.parseToJsonElement("""{"convs":[{"convId":"group:g1","type":"group","name":"g","maxSeq":2,"readSeq":2,"minSeq":1,"unread":0,"lastMsg":null,"updatedAt":2}],"truncated":false}"""),
+        )
+        c.receive("""{"cmd":"event","data":{"type":"msgDeleted","convId":"group:g1","msgIds":["g-1"],"seqs":[1],"recalled":{"by":"bob","at":5}}}""")
+        assertEquals(emptyList(), filesContaining(dir, secret))
+        assertEquals(emptyList(), dir.listFiles()!!.map { it.name }.filter { it.endsWith("-wal") })
+        e.close()
+        AndroidLocalDatabase.open(file).use { db ->
+            assertEquals(3L, db.query("PRAGMA user_version").single().values.single())
+            assertEquals(setOf("client", "id", "seq", "recalled"), db.query("SELECT kind FROM deleted_refs").map { it["kind"] }.toSet())
+        }
+        val e2 = Env(file)
+        val list = e2.im.messages("group:g1")
+        assertEquals(listOf(true, false), list.map { it.recalled })
+        assertEquals("recalled", list[1].body.quote!!.state.wire)
+        e2.close()
+        assertEquals(emptyList(), filesContaining(dir, secret))
+    }
+
+    @Test
     fun `Robolectric 的 ICU 没有中文排序数据：collator 返回 null，汉字归井号，不崩溃`() {
         val c = AndroidPinyin.collator()
         // 真机上的用例在 androidTest（AndroidDeviceTest）。这里只验证退化路径不出错。

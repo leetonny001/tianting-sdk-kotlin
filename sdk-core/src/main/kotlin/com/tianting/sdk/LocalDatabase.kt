@@ -17,7 +17,7 @@ public interface LocalDatabase : Closeable {
     public fun <T> transaction(block: () -> T): T
 }
 
-private const val SCHEMA_VERSION = 2L
+private const val SCHEMA_VERSION = 3L
 
 /** 冷启动时每个会话最多恢复多少条消息，更早的从库里删掉，靠向上翻页。 */
 internal const val RESTORE_LIMIT_PER_CONV = 200
@@ -29,7 +29,14 @@ internal class DeletedRefs(
     val removedClient: MutableSet<String> = HashSet(),
     /** 文件已过期的 msgId（F-RCL-03 规则 2a：expired 只能从假变真，跨冷启动保留）。 */
     val expired: MutableSet<String> = HashSet(),
+    /** 已知是撤回的 msgId / seq 和撤回信息（第 3 版，C4：recalled 只能从假变真，跨冷启动保留）。 */
+    val recalledIds: MutableMap<String, RecallInfo> = HashMap(),
+    val recalledSeqs: MutableMap<Long, RecallInfo> = HashMap(),
 )
+
+/** deleted_refs 里 kind='recalled' 的 ref：JSON {k: "id"|"seq", v, by, at?}（msgId 里可能有冒号，不用分隔符拼）。 */
+@kotlinx.serialization.Serializable
+internal data class RecalledRef(val k: String, val v: String, val by: String, val at: Long? = null)
 
 /** 从本地库恢复出来的全部状态。 */
 internal class RestoredState(
@@ -93,11 +100,14 @@ internal class LocalDb(private val db: LocalDatabase, private val log: Logger) :
         secureDeleteOk = (db.query("PRAGMA secure_delete=ON").firstOrNull()?.values?.firstOrNull() as? Long) == 1L
         db.query("PRAGMA journal_mode=DELETE")
         val version = db.query("PRAGMA user_version").firstOrNull()?.values?.firstOrNull() as? Long ?: 0L
-        if (version == 1L) {
-            // 第 1 版 → 第 2 版（FE-631，C2）：加附件沙盒和 modVer 两张表，原有的会话、消息（含待发、失败）、社交数据都保留。
-            // 新的发送状态（处理中、上传中）和消息的 image、file 都在 json 列里，旧行照常解码。
+        if (version == 1L || version == 2L) {
+            // 原地升级，原有的会话、消息（含待发、失败）、社交数据、deleted_refs 的旧行都保留：
+            // 第 1 版 → 第 2 版（FE-631，C2）：加附件沙盒和 modVer 两张表。新的发送状态和 image、file 都在 json 列里，旧行照常解码。
+            // 第 2 版 → 第 3 版（FE-661，C4）：deleted_refs 多一种 kind='recalled'；消息的 recalled、quote、mentions 和会话的
+            // mentionUnread、firstMentionSeq 都在 json 列里（旧行没有这些字段，按默认值解码），不改表结构。
+            // 版本号照样加 1：老版本 SDK 打开第 3 版的库会按"版本不同"重建，不会把撤回的记录当成不认识的行留着。
             db.transaction {
-                createV2Tables()
+                if (version == 1L) createV2Tables()
                 db.execute("PRAGMA user_version = $SCHEMA_VERSION")
             }
         } else if (version != SCHEMA_VERSION) {
@@ -266,6 +276,16 @@ internal class LocalDb(private val db: LocalDatabase, private val log: Logger) :
         for (s in seqs) db.execute("INSERT OR IGNORE INTO deleted_refs(conv_id, kind, ref) VALUES(?, 'seq', ?)", listOf(convId, s.toString()))
     }
 
+    override fun addRecalledRefs(convId: String, msgIds: Map<String, RecallInfo>, seqs: Map<Long, RecallInfo>) = guarded {
+        val refs = msgIds.map { (id, r) -> RecalledRef("id", id, r.by, r.at) } + seqs.map { (s, r) -> RecalledRef("seq", s.toString(), r.by, r.at) }
+        for (r in refs) {
+            db.execute(
+                "INSERT OR IGNORE INTO deleted_refs(conv_id, kind, ref) VALUES(?, 'recalled', ?)",
+                listOf(convId, ImJson.encodeToString(RecalledRef.serializer(), r)),
+            )
+        }
+    }
+
     /** removeFailed 删过的 clientMsgId。 */
     override fun addRemovedClient(convId: String, clientMsgIds: Collection<String>) = guarded {
         for (id in clientMsgIds) db.execute("INSERT OR IGNORE INTO deleted_refs(conv_id, kind, ref) VALUES(?, 'client', ?)", listOf(convId, id))
@@ -378,6 +398,15 @@ internal class LocalDb(private val db: LocalDatabase, private val log: Logger) :
                 "seq" -> e.seqs.add((r["ref"] as String).toLong())
                 "client" -> e.removedClient.add(r["ref"] as String)
                 "expired" -> e.expired.add(r["ref"] as String)
+                "recalled" -> {
+                    val ref = runCatching { ImJson.decodeFromString(RecalledRef.serializer(), r["ref"] as String) }.getOrNull() ?: continue
+                    val info = RecallInfo(ref.by, ref.at)
+                    // 同一条撤回了多次（本端估算的 at 和服务端的不同）：保留有操作者的那份。
+                    when (ref.k) {
+                        "id" -> e.recalledIds.merge(ref.v, info) { a, b -> if (a.by.isNotEmpty()) a else b }
+                        "seq" -> ref.v.toLongOrNull()?.let { s -> e.recalledSeqs.merge(s, info) { a, b -> if (a.by.isNotEmpty()) a else b } }
+                    }
+                }
             }
         }
         val meta = db.query("SELECT social_ver, request_seen_ver, settings, official, loaded FROM social_meta").firstOrNull()
