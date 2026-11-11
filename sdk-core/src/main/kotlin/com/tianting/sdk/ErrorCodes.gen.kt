@@ -42,6 +42,7 @@ public object ErrorCode {
     public const val USERNAME_TAKEN: Int = 4095
     public const val FILE_NOT_READY: Int = 4096
     public const val RECALL_WINDOW_EXPIRED: Int = 4097
+    public const val REPORT_ALREADY_HANDLED: Int = 4098
     public const val GROUP_MEMBER_LIMIT_EXCEEDED: Int = 4130
     public const val BATCH_LIMIT_EXCEEDED: Int = 4131
     public const val FRIEND_LIMIT_EXCEEDED: Int = 4132
@@ -57,6 +58,7 @@ public object ErrorCode {
     public const val QUOTA_EXCEEDED: Int = 4292
     public const val MENTION_ALL_LIMITED: Int = 4293
     public const val ACCOUNT_LOGIN_LOCKED: Int = 4294
+    public const val CONTENT_BLOCKED: Int = 4510
     public const val INTERNAL: Int = 5000
     public const val SERVICE_UNAVAILABLE: Int = 5030
     public const val OBJECT_STORE_UNAVAILABLE: Int = 5032
@@ -103,6 +105,7 @@ internal val ERROR_INFO: Map<Int, ErrorInfo> = mapOf(
     4095 to ErrorInfo("USERNAME_TAKEN", false, "用户名已存在或保留"),
     4096 to ErrorInfo("FILE_NOT_READY", false, "文件未完成上传，或已绑定其他消息"),
     4097 to ErrorInfo("RECALL_WINDOW_EXPIRED", false, "超过撤回时限（details.windowSeconds）"),
+    4098 to ErrorInfo("REPORT_ALREADY_HANDLED", false, "举报已被处理"),
     4130 to ErrorInfo("GROUP_MEMBER_LIMIT_EXCEEDED", false, "群成员已达上限"),
     4131 to ErrorInfo("BATCH_LIMIT_EXCEEDED", false, "单次批量操作数量超限"),
     4132 to ErrorInfo("FRIEND_LIMIT_EXCEEDED", false, "好友数量已达上限"),
@@ -118,6 +121,7 @@ internal val ERROR_INFO: Map<Int, ErrorInfo> = mapOf(
     4292 to ErrorInfo("QUOTA_EXCEEDED", false, "今天的次数已用完"),
     4293 to ErrorInfo("MENTION_ALL_LIMITED", false, "@ 所有人次数用完（details.retryAfterSeconds）"),
     4294 to ErrorInfo("ACCOUNT_LOGIN_LOCKED", false, "尝试过多，暂时锁定（details.retryAfterSeconds）"),
+    4510 to ErrorInfo("CONTENT_BLOCKED", false, "内容被拦截"),
     5000 to ErrorInfo("INTERNAL", true, "服务器内部错误"),
     5030 to ErrorInfo("SERVICE_UNAVAILABLE", true, "服务暂不可用"),
     5032 to ErrorInfo("OBJECT_STORE_UNAVAILABLE", true, "对象存储暂不可用（reason: completeInProgress 是同一上传的 complete 正在进行）"),
@@ -143,6 +147,7 @@ public val CLIENT_ERROR_CODES: Set<Int> = setOf(
     4290,
     4292,
     4294,
+    4510,
     5000,
     5030,
     5032,
@@ -150,11 +155,11 @@ public val CLIENT_ERROR_CODES: Set<Int> = setOf(
 
 /** 错误码 → 细分的 reason（PRD-chat 第 11.5 节）。收到没有列出的 reason 不能报错。 */
 public val ERROR_REASONS: Map<Int, List<String>> = mapOf(
-    4000 to listOf("passwordWeak", "recoveryCodeStale", "fileKindMismatch", "uploadMismatch", "fileNameTooLong"),
+    4000 to listOf("passwordWeak", "recoveryCodeStale", "fileKindMismatch", "uploadMismatch", "fileNameTooLong", "customDisabled"),
     4011 to listOf("tokenSuperseded"),
     4019 to listOf("invalid", "expired", "revoked", "superseded", "replayDetected", "credentialsChanged", "loggedOutOthers", "accountDeleted"),
     4030 to listOf("registerClosed", "inviteInvalid", "accountSessionRequired", "accountExists", "accountDeletionPending", "featureDisabled", "mentionAllForbidden"),
-    4040 to listOf("quoteUnavailable"),
+    4040 to listOf("quoteUnavailable", "reportTargetInvalid"),
     4290 to listOf("recoverLimited", "uploadPendingLimit"),
     5032 to listOf("completeInProgress"),
 )

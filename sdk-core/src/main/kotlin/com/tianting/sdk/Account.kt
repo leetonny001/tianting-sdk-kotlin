@@ -166,8 +166,15 @@ public data class AccountConfig(
      * msgActions：撤回、引用、@（C4，服务端 IM_MSG_ACTIONS_ENABLED）；老服务端没有这个字段，按关闭处理（PRD-ui F-UI-09 规则 4，问题 36）。
      * convSettings：会话置顶、免打扰、删除（C5，IM_CONV_SETTINGS_ENABLED，backend-chat 第 75 条）；老服务端没有按关闭。
      * 关闭时页面只隐藏入口（新命令服务端回 4030），已有的置顶、免打扰、删除照常生效（P-46 ②），SDK 不按它过滤。
+     * moderation：举报入口（C6，IM_MOD_ENABLED，backend-chat 第 96 条）；老服务端没有按关闭。关闭时消息菜单、资料卡、群信息页都不显示
+     * "举报"；只控制举报入口，4510 的提示和它无关（frontend-chat 第 76 条）。
      */
-    public data class Features(val files: Boolean, val msgActions: Boolean = false, val convSettings: Boolean = false)
+    public data class Features(
+        val files: Boolean,
+        val msgActions: Boolean = false,
+        val convSettings: Boolean = false,
+        val moderation: Boolean = false,
+    )
 
     @Serializable
     public data class Limits(

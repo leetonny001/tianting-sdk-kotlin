@@ -21,7 +21,8 @@ import kotlinx.serialization.json.intOrNull
 public enum class MessageStatus { QUEUED, SENDING, SENT, FAILED, PROCESSING, UPLOADING }
 
 /**
- * 发送失败的原因：错误码（4292 上传额度用完、4290 + errorReason=uploadPendingLimit、4139、4150、4096、5032…），
+ * 发送失败的原因：错误码（4292 上传额度用完、4290 + errorReason=uploadPendingLimit、4139、4150、4096、5032、
+ * 4510 内容被拦截（不能重发，见 IMClient.canRetry）…），
  * 或超时、被踢、Network（上传时网络或对象存储出错，或上传被进程结束打断）、Process（App 处理图片失败："无法处理这张图片，请用文件方式发送"）、
  * Storage（复制到沙盒失败："存储空间不足"）、SourceMissing（要重新上传但沙盒副本已不在："原文件已不可用，请重新选择"）。
  */

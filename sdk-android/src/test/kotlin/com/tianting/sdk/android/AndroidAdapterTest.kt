@@ -2,7 +2,9 @@ package com.tianting.sdk.android
 
 import com.tianting.sdk.IMClient
 import com.tianting.sdk.IMClientOptions
+import com.tianting.sdk.MessageStatus
 import com.tianting.sdk.MsgBody
+import com.tianting.sdk.SendError
 import com.tianting.sdk.PushCursorState
 import com.tianting.sdk.pinyinGroup
 import com.tianting.sdk.testing.FakeClock
@@ -67,6 +69,36 @@ class AndroidAdapterTest {
             val h = f.readBytes()
             (0..h.size - n.size).any { i -> n.indices.all { j -> h[i + j] == n[j] } }
         }.map { it.name }.toList()
+    }
+
+    @Test
+    fun `FE-691：4510 的失败消息在系统 SQLite 上带失败原因保存，冷启动后仍是 4510、不能重发（frontend-chat 第 81 条）`() {
+        val dir = tmp.newFolder()
+        val file = File(dir, "im.db")
+        val e = Env(file)
+        e.im.connect("t")
+        e.scheduler.runCurrent()
+        val c = e.transport.current
+        c.open()
+        c.ack("auth", Json.parseToJsonElement("""{"userId":"alice","serverTime":1}"""))
+        c.ack(
+            "convs",
+            Json.parseToJsonElement("""{"convs":[{"convId":"group:g1","type":"group","name":"g","maxSeq":0,"readSeq":0,"minSeq":1,"unread":0,"lastMsg":null,"updatedAt":0}],"truncated":false}"""),
+        )
+        e.scope.launch { e.im.send("group:g1", "含 ZXQWORD 的消息") }
+        e.scheduler.runCurrent()
+        c.ackError("send", 4510, "content blocked")
+        val m = e.im.messages("group:g1").single()
+        assertEquals(SendError.Code(4510), m.error)
+        e.close()
+
+        val e2 = Env(file)
+        val r = e2.im.messages("group:g1").single()
+        assertEquals(m.clientMsgId, r.clientMsgId)
+        assertEquals(MessageStatus.FAILED, r.status)
+        assertEquals(SendError.Code(4510), r.error)
+        assertEquals(false, e2.im.canRetry(r))
+        e2.close()
     }
 
     @Test

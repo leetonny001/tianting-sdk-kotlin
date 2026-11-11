@@ -190,6 +190,25 @@ IMEvent.ConvDeleted(convId)          // 本端删除成功或其他设备删除�
 | 物理清除 | 内存、本地库的行、缓存目录的文件（`FilesExpired`）一起清；迟到的 sync、ack 不写回；本机待发的消息 ack 晚到、seq 落在清除范围里时这条一起去掉（问题 68）。服务端的 `minSeq`（`convs`、`convAdded`）比本地下限小时放低下限、旧历史可以再加载（重新入群，规则 6a，问题 65）。保留下来的消息里的引用摘要照常显示，只有本端没发出、引用了被清除消息的清除原文（问题 62） |
 | 本地库 | 第 4 版：`cleared_convs`（被删除隐藏的会话，没有摘要）、`pending_purges`（"待清除"：清除前单独提交，清除的事务里删掉；失败或进程中途结束时下次 `open()` 补清，连同缓存文件）。第 1～3 版原地升级。置顶、免打扰在会话的 json 列里，冷启动先显示，`convs` 回来以服务端为准 |
 
+## 举报、内容拦截（FE-691，C6）
+
+语义和 sdk-ts 相同（FE-690）。服务端开关 `IM_MOD_ENABLED`；`AccountConfig.Features.moderation` 关闭（老服务端没有这个字段也按关闭）时三类举报入口都不显示，4510 的提示和它无关（frontend-chat 第 76 条）。
+
+```kotlin
+val reportId = im.report(ReportTarget.Messages(convId, listOf(msgId)), ReportReason.ABUSE, note) // 第一批页面只举报单条，接口保留列表
+im.report(ReportTarget.User(userId), ReportReason.SPAM)
+im.report(ReportTarget.Group(groupId), ReportReason.ILLEGAL)
+im.canReport(m)                     // 消息菜单、撤回提示行有没有"举报"（三套 SDK 同一口径，问题 77、88）
+im.canRetry(m)                      // 失败气泡有没有"重发"：4510（内容被拦截）和 SourceMissing 没有，只有"复制""删除"
+messageFor("send", 4510)            // "消息包含不当内容，无法发送"；其他命令和账号接口："内容包含不当信息，请修改后重试"（P-48 ⑥）
+```
+
+| 规则 | 说明 |
+|---|---|
+| `report` | 本地先校验：`msgIds` 1～20 条合法 ID，`note` 不超过 200 个码点，`convId` 严格格式（单聊自己必须是参与者，聊天室不能举报），`userId`、`groupId` 格式；不合法直接抛 `IMError` 4000（`details.field`），不发帧。对象类型由 `ReportTarget` 保证互斥。服务端的 4292、4040 `reportTargetInvalid`、4030 `featureDisabled`、4290、5000、超时、未连接原样抛出，不自动重试（文案 `messageFor("report", code)`：4040"无法举报该内容"、4030"举报功能暂不可用"、4292"今天的举报次数已用完"）。`note` 不进日志和错误信息 |
+| `canReport` | 别人发的、已经发送成功的 `text`、`image`、`file`；自己的、`tip`、`custom`、发送中和失败的、后台删除的都没有；撤回提示行只在**别人**撤回的消息上有（自己以群主、管理员身份撤回的没有）。不看 `features.moderation`，开关由页面判断；资料卡、群信息页的入口由页面判断 |
+| 4510 | `send`、`sendImage`、`sendFile` 收到 4510：消息标记失败、`error = SendError.Code(4510)`，不自动重发、不重新上传，`retry` 也不发；超时之后才到的 4510 同样改成 4510（不再发 `SendFailed`）。失败原因在本地库消息的 json 里，冷启动后仍是 4510、仍不能重发。错误里没有命中的词。其他 WS 命令（建群、改群名等）原样抛 `IMError` 4510；账号接口（注册、改昵称）抛 `AccountError(status = 451, code = 4510)` |
+
 ## 开发
 
 需要 JDK 21。Gradle 用项目内的 Wrapper。
@@ -221,6 +240,8 @@ TIANTING_SERVER_DIR=/path/to/tianting-server/server ./gradlew :sdk-core:integrat
 ```
 
 `ConvSettingsIntegrationTest`（C5）用 `IM_CONV_SETTINGS_ENABLED=1`；服务端命令（BE-483～486）完成之前 `convSet`、`convDelete` 回 4001，这些用例如实失败，不跳过。
+
+`ReportIntegrationTest`（C6）用 `IM_MOD_ENABLED=1` 和测试用的 `IM_REPORT_KEY`，4510 的服务端另给调用方 `moderation.words` scope 加特征词；服务端（BE-492～496）完成之前 `features.moderation` 是 false、`report` 回 4001、不认识这个 scope（服务端启动失败），这些用例如实失败，不跳过。
 
 CI 里的集成测试需要读取私有仓库 tianting-server：配置只读部署密钥和 Actions secret `TIANTING_SERVER_DEPLOY_KEY`。没配置时 CI 跳过集成测试，只跑单元测试。
 

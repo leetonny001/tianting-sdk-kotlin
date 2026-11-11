@@ -131,6 +131,7 @@ class VectorsTest : SdkTest() {
             "convs" in data -> { d -> ImJson.decodeFromJsonElement(ConvsAck.serializer(), d) }
             "conv" in data -> { d -> ImJson.decodeFromJsonElement(ConvSetAck.serializer(), d) } // C5
             "clearedSeq" in data -> { d -> ImJson.decodeFromJsonElement(ConvDeleteAck.serializer(), d) } // C5
+            "reportId" in data -> { d -> ImJson.decodeFromJsonElement(ReportAck.serializer(), d) } // C6
             "seq" in data -> { d -> ImJson.decodeFromJsonElement(SendAck.serializer(), d) }
             "hasMore" in data && "messages" in data -> { d -> ImJson.decodeFromJsonElement(SyncAck.serializer(), d) }
             "user" in data -> { d -> ImJson.decodeFromJsonElement(SearchAck.serializer(), d) }
@@ -162,6 +163,71 @@ class VectorsTest : SdkTest() {
         assertFalse(ack.deletedTruncated)
         val t = frames["valid"]!!.jsonArray.map { it.jsonObject }.single { it["name"]!!.str == "ack convs deletedTruncated（C5）" }
         assertTrue(ImJson.decodeFromJsonElement(ConvsAck.serializer(), t["frame"]!!.jsonObject["data"]!!).deletedTruncated)
+    }
+
+    // ---- frames.json 的 C6（report、ack reportId、4510 不带 details 的错误 ack）：TC-CHAT-90-46 ----
+
+    private fun c6(kind: String) = frames[kind]!!.jsonArray.map { it.jsonObject }.filter { "（C6" in it["name"]!!.str }
+
+    @Test
+    fun `TC-CHAT-90-46 frames json 的 C6 用例都在（13 个合法、32 个非法）`() {
+        assertEquals(13, c6("valid").size)
+        assertEquals(32, c6("invalid").size)
+    }
+
+    @Test
+    fun `TC-CHAT-90-46 frames json 合法的 report：SDK 用同样的参数发出同样的 data，ack 的 reportId 原样返回`() {
+        val h = setup()
+        h.connect()
+        val c = h.login("u1", listOf(conv("group:g1"), conv("c2c:u1:u2")))
+        val reports = c6("valid").map { it["frame"]!!.jsonObject }.filter { it["cmd"]!!.str == "report" }
+        assertEquals(7, reports.size)
+        for (f in reports) {
+            val d = f["data"]!!.jsonObject
+            val target = when (d["targetType"]!!.str) {
+                "message" -> ReportTarget.Messages(d["convId"]!!.str, d["msgIds"]!!.jsonArray.map { it.str })
+                "user" -> ReportTarget.User(d["userId"]!!.str)
+                else -> ReportTarget.Group(d["groupId"]!!.str)
+            }
+            val reason = ReportReason.entries.single { it.wire == d["reason"]!!.str }
+            val p = h.start { report(target, reason, d["note"]?.str) }
+            assertEquals(d, c.last("report").dataObj)
+            c.ack("report", obj("reportId" to "rp_01J9ZXQ"))
+            assertEquals("rp_01J9ZXQ", h.await(p))
+        }
+    }
+
+    @Test
+    fun `TC-CHAT-90-46 frames json 非法的 report（有 data 的）在本地就拒绝：4000，不发帧`() {
+        val h = setup()
+        h.connect()
+        val c = h.login("u1", listOf(conv("group:g1")))
+        val bad = c6("invalid").map { it["name"]!!.str to it["frame"]!!.jsonObject }
+            .filter { (_, f) -> f["cmd"]?.str == "report" && f["id"] != null && f["data"] is JsonObject }
+        // 27 个：含别的对象的字段带空串或 null、note 为 null（tianting-server 6ef4217 加的 5 个，互斥违规）。
+        assertEquals(27, bad.size)
+        for ((name, f) in bad) {
+            val e = h.failure(h.start { reportJson(f["data"]!!.jsonObject) })
+            assertTrue(e is IMError && e.code == ErrorCode.BAD_REQUEST, "$name: $e")
+        }
+        assertEquals(emptyList(), c.frames("report"))
+    }
+
+    @Test
+    fun `TC-CHAT-90-46 4510、4040 reportTargetInvalid 的错误 ack 解码出码和 reason；reportId 不是字符串按协议错误`() {
+        val blocked = c6("valid").single { it["name"]!!.str == "ack 4510 没有 details（C6）" }["frame"]!!.jsonObject["error"]!!
+        val e = ImJson.decodeFromJsonElement(ErrorBody.serializer(), blocked)
+        assertEquals(4510, e.code)
+        assertNull(e.details)
+        val nf = c6("valid").single { it["name"]!!.str == "ack report 4040 reportTargetInvalid（C6）" }["frame"]!!.jsonObject["error"]!!
+        assertEquals("reportTargetInvalid", ImJson.decodeFromJsonElement(ErrorBody.serializer(), nf).reason)
+
+        val h = setup()
+        h.connect()
+        val c = h.login("u1")
+        val p = h.start { report(ReportTarget.User("u9"), ReportReason.SPAM) }
+        c.ack("report", obj("reportId" to 1))
+        assertIs<ProtocolDecodeError>(h.failure(p))
     }
 
     @Test

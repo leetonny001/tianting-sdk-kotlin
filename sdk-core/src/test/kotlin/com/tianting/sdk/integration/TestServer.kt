@@ -22,6 +22,9 @@ private const val ADMIN_KEY = "sdk-it-admin-key-0123456789abcdef"
 private const val CALLER_ID = "sdk-it"
 private const val CALLER_SECRET = "sdk-it-caller-secret-0123456789abcdef"
 
+/** 调用方的 scope（所有集成用例共用）。 */
+private val BASE_SCOPES = listOf("user.ban", "msg.delete", "mute.write", "group.write", "social.settings", "social.friends", "push.user", "push.all", "account.invite", "user.read")
+
 /** 打开第二批功能（IM_V13_ADMIN_FEATURES）需要的环境变量。 */
 val MODERATION_ENV = mapOf("IM_V13_ADMIN_FEATURES" to "1", "IM_QUARANTINE_KEY" to "sdk-it-quarantine-key-0123456789abcdef")
 
@@ -138,13 +141,17 @@ class TestServer private constructor(private val proc: Process, private val admi
 
         private fun freePort(): Int = ServerSocket(0).use { it.localPort }
 
-        suspend fun start(env: Map<String, String> = emptyMap()): TestServer {
+        /**
+         * extraScopes：只给这个服务端的调用方多配的 scope（C6 的 moderation.words 等）。服务端不认识的 scope 会启动失败，
+         * 所以不加进公共的列表，免得其他集成用例跟着失败（同 sdk-ts 的 startServer）。
+         */
+        suspend fun start(env: Map<String, String> = emptyMap(), extraScopes: List<String> = emptyList()): TestServer {
             val port = freePort()
             val adminPort = freePort() // 管理接口在单独的端口上（PRD-admin F-KEY-01）
             val dir = Files.createTempDirectory("im-sdk-db-").toFile()
             val callers = File(dir, "callers.json")
             val secret = Base64.getEncoder().encodeToString(CALLER_SECRET.toByteArray())
-            callers.writeText("""[{"id":"$CALLER_ID","alg":"hmac-sha256","secret":"$secret","scopes":["user.ban","msg.delete","mute.write","group.write","social.settings","social.friends","push.user","push.all","account.invite","user.read"],"pushTypes":["notice","promo"]}]""")
+            callers.writeText("""[{"id":"$CALLER_ID","alg":"hmac-sha256","secret":"$secret","scopes":[${(BASE_SCOPES + extraScopes).joinToString(",") { "\"$it\"" }}],"pushTypes":["notice","promo"]}]""")
             Files.setPosixFilePermissions(callers.toPath(), PosixFilePermissions.fromString("rw-------"))
             val pb = ProcessBuilder(bin.absolutePath)
                 .redirectOutput(ProcessBuilder.Redirect.DISCARD)

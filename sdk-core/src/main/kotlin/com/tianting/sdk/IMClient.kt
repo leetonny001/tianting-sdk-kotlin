@@ -482,6 +482,8 @@ public class IMClient(private val o: IMClientOptions) {
      * mentions 是 @ 的人（F-MEN-01、02），只在群聊，单聊带了抛 IllegalArgumentException；userIds 去重，全空且没有 all 时不带。
      * 正文里的 "@昵称 " 由 App 插入（用资料昵称，不用备注，R-CF-03）。4040（errorReason=quoteUnavailable）、4293（@ 所有人次数用完）、
      * 4131 和其他错误码一样标记失败，不自动重发。
+     * 4510（内容被拦截，C6）：标记失败，error=SendError.Code(4510)，不自动重发，也不能手动重发（canRetry 为 false，frontend-chat 第 81 条）；
+     * 错误里没有命中的词（服务端不给 details）。文案 messageFor("send", 4510)。sendImage、sendFile 同样，不重新上传。
      */
     public suspend fun send(convId: String, text: String, quote: QuoteRef? = null, mentions: Mentions? = null): SendResult = onSdk {
         when (val check = checkText(text)) {
@@ -629,6 +631,46 @@ public class IMClient(private val o: IMClientOptions) {
         db.markPurges(store.purgeTargets(mins))
     }
 
+    // ---- 举报、内容拦截（FE-691，PRD-chat 第 10 节 C6） ----
+
+    /**
+     * 举报（PRD-chat F-MOD-03，第 13.1 节）：返回 reportId。参数在本地先校验（targetType 互斥、msgIds 1～20 条且格式合法、
+     * note 不超过 200 个码点、convId 严格格式，单聊自己必须是参与者，聊天室不能举报），不合法直接抛 IMError 4000（details.field），不发帧。
+     * 服务端的错误原样抛出，不自动重试：4292（今天的举报次数已用完）、4040 reportTargetInvalid（"无法举报该内容"）、
+     * 4030 featureDisabled（"举报功能暂不可用"）、4290、5000、TimeoutError、NotConnectedError；文案 messageFor("report", code)。
+     * 被举报人、举报人都不会收到帧。入口是否显示看 GET /v1/config 的 features.moderation，消息菜单再看 canReport。
+     * note 按正文对待：不进日志、不进错误信息。
+     */
+    public suspend fun report(target: ReportTarget, reason: ReportReason, note: String? = null): String =
+        reportJson(reportData(target, reason, note))
+
+    /** report 的实现：data 是 report 命令的 data（共享用例 frames.json 的非法 report 直接从这里进，本地拒绝）。 */
+    internal suspend fun reportJson(data: JsonObject): String = onSdk {
+        checkReport(data, self)
+        req("report", data, ReportAck.serializer()).reportId
+    }
+
+    /**
+     * 消息菜单里有没有"举报"（frontend-chat 第 77、88 条，三套 SDK 同一口径）：别人发的、已经发送成功的 text、image、file；
+     * 自己的、tip、custom、发送中和失败的都没有；后台删除的没有。撤回提示行只在**别人**撤回的消息上有（隔离原文过期后点了
+     * 仍会成功，证据只有元数据，AC-MOD-03-12），我自己（群主、管理员）撤回的别人的消息没有。
+     * 不看 features.moderation：开关关闭时页面不显示任何举报入口（第 76 条）。资料卡、群信息页的入口由页面判断。可以从任意线程调。
+     */
+    public fun canReport(m: Message): Boolean {
+        val me = self
+        if (m.status != MessageStatus.SENT || m.msgId == null || me.isEmpty() || m.from == me) return false
+        if (m.type != MsgType.TEXT && m.type != MsgType.IMAGE && m.type != MsgType.FILE) return false
+        if (m.recalled) return m.recalledBy != me
+        return !m.deleted
+    }
+
+    /**
+     * 失败的消息能不能"重发"（失败气泡的按钮）。4510 被拦截的不能（原样重发一定还是 4510，frontend-chat 第 81 条），
+     * 只有"复制""删除"，冷启动后也一样（失败原因存在本地库里）；SourceMissing（原文件已不可用）也不能，只能删除。其余失败的可以。
+     */
+    public fun canRetry(m: Message): Boolean =
+        m.status == MessageStatus.FAILED && m.error != SendError.Code(ErrorCode.CONTENT_BLOCKED) && m.error != SendError.SourceMissing
+
     // ---- 撤回（FE-661，PRD-chat F-RCL-01～03） ----
 
     /**
@@ -708,10 +750,11 @@ public class IMClient(private val o: IMClientOptions) {
      * 手动重发失败的消息，沿用原来的 clientMsgId（PRD F-MSG-03 规则 2）。
      * 附件（F-FILE-07 规则 4）：已经 complete 的复用同一 fileId，不重传（AC-FILE-07-2）；没上传完的用沙盒副本从头上传（新的 fileId，
      * AC-FILE-07-1、07-5）；沙盒副本已经不在的不动，error 改成 SourceMissing（"原文件已不可用，请重新选择"，只能删除）。
+     * canRetry 为 false 的（4510、SourceMissing）不动：不发帧、不重新上传。
      */
     public suspend fun retry(convId: String, clientMsgId: String): Unit = onSdk {
         val m = store.listIfExists(convId)?.local(clientMsgId)
-        if (m == null || m.status != MessageStatus.FAILED) return@onSdk
+        if (m == null || !canRetry(m)) return@onSdk
         if (needsUpload(m)) {
             if (!hasSource(clientMsgId) || (sources[clientMsgId]?.rec?.copied == true && !withContext(io) { java.io.File(sandboxOf(clientMsgId), "original").isFile })) {
                 store.list(convId).update(clientMsgId) { it.copy(error = SendError.SourceMissing, errorReason = null) }
@@ -2311,6 +2354,8 @@ public class IMClient(private val o: IMClientOptions) {
                             guard { onAck(decode("send", SendAck.serializer(), lateData)) }
                         } else if (err.code == ErrorCode.MUTED) {
                             onMutedAck(err.details)
+                        } else if (err.code == ErrorCode.CONTENT_BLOCKED) {
+                            guard { lateBlocked(convId, clientMsgId) }
                         }
                     },
                 )
@@ -2338,6 +2383,18 @@ public class IMClient(private val o: IMClientOptions) {
                 }
             }
         }
+    }
+
+    /**
+     * 超时标记失败之后才到的 4510：失败原因改成 4510，气泡不再提供"重发"（frontend-chat 第 81 条），写进本地库。
+     * 只改仍然是超时失败的；用户已经手动重发（又在发送中）的以那次的结果为准。不再发 SendFailed（页面已经提示过失败）。
+     */
+    private fun lateBlocked(convId: String, clientMsgId: String) {
+        val list = store.listIfExists(convId) ?: return
+        val m = list.local(clientMsgId)
+        if (m == null || m.status != MessageStatus.FAILED || m.error != SendError.Timeout) return
+        list.update(clientMsgId) { it.copy(error = SendError.Code(ErrorCode.CONTENT_BLOCKED), errorReason = null) }
+        emitMessages(convId)
     }
 
     private fun fail(convId: String, clientMsgId: String, error: SendError, reason: String? = null) {

@@ -181,6 +181,47 @@ class FilesTest : AccountTest() {
         assertEquals(FileBody("F9", SECRET_NAME, 5000, "application/pdf"), a.im.messages(G1)[0].body.file)
     }
 
+    // ---- 4510（C6，F-MOD-02 规则 6，AC-MOD-02-4 的客户端侧：文件名命中；frontend-chat 第 81 条） ----
+
+    @Test
+    fun `TC-MOD-02-09 图片 send 回 4510：标记失败、error=4510，不重新上传、不重发；断线重连也不自动发`() {
+        val (a, c) = online()
+        a.sendImage()
+        a.uploadOk("F1")
+        c.ackBlocked("send")
+        assertEquals(listOf("cid-0001:failed(4510)"), a.status())
+        val m = a.im.messages(AB).single()
+        assertFalse(a.im.canRetry(m))
+        assertEquals(listOf(IMEvent.SendFailed(AB, "cid-0001", SendError.Code(4510))), a.h.failed())
+        a.h.call { retry(AB, "cid-0001") }
+        c.drop()
+        a.h.reconnectAuth(USER, waitMs = 60_000)
+        a.clock.advance(60_000)
+        assertEquals(1, a.h.transport.connections.sumOf { sends(it).size })
+        assertEquals(1, a.http.to(UPLOADS).size)
+        assertEquals(2, a.h.objects.calls.size)
+        assertEquals(listOf("cid-0001:failed(4510)"), a.status())
+        // 只能删除：沙盒副本一起删掉。
+        assertTrue(a.h.call { removeFailed(AB, "cid-0001") })
+        assertEquals(emptyList(), a.sandbox())
+    }
+
+    @Test
+    fun `TC-MOD-02-09 文件（文件名命中）send 回 4510：同样失败、不重新上传、不重发`() {
+        val (a, c) = online()
+        a.h.call { sendFile(G1, FileInput(tmpFile(10), "ZXQ-FILE-WORD.pdf", "application/pdf")) }
+        a.grant("F9", thumb = false)
+        a.h.objects.pending[0].respond(200)
+        a.http.last("/v1/files/F9/complete").respond(200, obj("fileId" to "F9", "size" to 10, "mime" to "application/pdf"))
+        c.ackBlocked("send")
+        assertEquals(listOf("cid-0001:failed(4510)"), a.status(G1))
+        assertFalse(a.im.canRetry(a.im.messages(G1).single()))
+        a.h.call { retry(G1, "cid-0001") }
+        a.clock.advance(60_000)
+        assertEquals(1, sends(c).size)
+        assertEquals(1, a.http.to(UPLOADS).size)
+    }
+
     @Test
     fun `复制进沙盒失败：失败，error=Storage（存储空间不足），不申请上传`() {
         val (a, _) = online()
