@@ -225,7 +225,8 @@ ANDROID_HOME=… ./gradlew :sdk-android:connectedDebugAndroidTest  # 连着设�
 `protocol/` 是服务端仓库协议文件的副本（错误码、帧 Schema、共享测试用例），不要直接改。服务端协议变更后：
 
 ```bash
-scripts/sync-protocol.sh       # 默认从同级目录 ../tianting-server（或 ../im-mvp）同步，并重新生成 ErrorCodes.gen.kt
+scripts/sync-protocol.sh       # 默认取同级目录 ../tianting-server（或 ../im-mvp）的 HEAD（git archive，只取已提交的内容，问题 90），并重新生成 ErrorCodes.gen.kt
+scripts/sync-protocol.sh ../im-mvp 596de46     # 指定检出目录和提交；也可以传 git archive 导出的目录 + 提交号
 ```
 
 错误码由 `./gradlew :sdk-core:generateErrors` 生成，`check` 任务和 `VectorsTest` 都会校验一致。SDK 发出的每一帧在单元测试里都会用 `frame.schema.json` 校验，账号接口的请求体用 `http-client.schema.json` 校验。假 HTTP 是 `com.tianting.sdk.testing.FakeHttp`。
