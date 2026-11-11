@@ -191,7 +191,7 @@ class ReportTest : AccountTest() {
 
     @Test
     fun `canReport：别人发的已发送 text、image、file 有；自己的、tip、custom、发送中、失败、后台删除的没有；撤回提示行只在别人撤回的上有`() {
-        val (h, c) = online(listOf(conv(G, maxSeq = 20, myRole = "admin"), conv(AB, maxSeq = 2)))
+        val (h, c) = online(listOf(conv(G, maxSeq = 20, readSeq = 20, myRole = "admin"), conv(AB, maxSeq = 2)))
         fun typed(seq: Long, type: String, body: JsonObject) = JsonObject(m(G, seq, body = body) + mapOf("type" to js(type)))
         h.loaded(
             c, G,
@@ -227,6 +227,41 @@ class ReportTest : AccountTest() {
 
         // 还不知道自己是谁时一律没有。
         assertFalse(setup().im.canReport(other))
+    }
+
+    @Test
+    fun `canReport（问题 92）：只有 seq ≤ 会话 readSeq 的才有；已读推进后（本端看过、其他端已读）出现；会话不在本地列表里的没有`() {
+        val (h, c) = online(listOf(conv(G, maxSeq = 5, readSeq = 2)))
+        h.loaded(c, G, (1L..5L).map { m(G, it) } + listOf(recalledMsg(G, 6, from = "bob")))
+        fun can() = h.im.messages(G).associate { it.seq!! to h.im.canReport(it) }
+        // 边界：seq = readSeq 有，readSeq + 1 没有；撤回提示行同样按 readSeq（服务端 readSeq ≥ seq）。
+        assertEquals(mapOf(1L to true, 2L to true, 3L to false, 4L to false, 5L to false, 6L to false), can())
+        // 其他端已读到 4。
+        c.receive(event("readUpdated", "convId" to G, "readSeq" to 4))
+        assertEquals(mapOf(1L to true, 2L to true, 3L to true, 4L to true, 5L to false, 6L to false), can())
+        // 本端打开会话、页面可见：上报已读到最新，本地立即推进。
+        h.im.setActiveConversation(G)
+        h.flush()
+        assertEquals(6L, c.last("read").dataObj["seq"]!!.str.toLong())
+        assertTrue(can().values.all { it }, can().toString())
+
+        // 会话不在本地列表里（例如已删除、已退群，或者构造出来的消息）：不显示。
+        val stranger = h.bySeq(G, 1).copy(convId = "group:g9")
+        assertFalse(h.im.canReport(stranger))
+        // 没有 seq 的（防御）也没有。
+        assertFalse(h.im.canReport(h.bySeq(G, 1).copy(seq = null)))
+    }
+
+    @Test
+    fun `canReport：自己的消息被别人（群主、管理员）撤回后，提示行不显示"举报"（问题 92）`() {
+        val (h, c) = online(listOf(conv(G, maxSeq = 3, readSeq = 3)))
+        h.loaded(c, G, listOf(m(G, 1, from = "alice"), m(G, 2)))
+        c.receive(recalledEvent(G, 1, by = "bob"))
+        c.receive(recalledEvent(G, 2, by = "bob"))
+        val mine = h.bySeq(G, 1)
+        assertTrue(mine.recalled && mine.recalledBy == "bob" && mine.from == "alice")
+        assertFalse(h.im.canReport(mine))
+        assertTrue(h.im.canReport(h.bySeq(G, 2))) // 对照：别人自己撤回的有
     }
 
     // ---- 4510（F-MOD-02 规则 6，AC-MOD-02-9 的 SDK 部分，frontend-chat 第 81 条） ----

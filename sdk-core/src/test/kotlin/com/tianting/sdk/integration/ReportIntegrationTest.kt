@@ -97,6 +97,11 @@ class ReportIntegrationTest {
 
         fun users(vararg ids: String) = srv.importUsers(*ids.map { it to null }.toTypedArray())
 
+        /** 建群要求被邀请的人是好友、至少 2 人（PRD-social）：用管理接口直接建立好友关系。 */
+        fun friends(a: String, vararg others: String) {
+            srv.signed("POST", "/admin/friends/import", obj("pairs" to others.map { obj("a" to a, "b" to it) }))
+        }
+
         suspend fun sent(im: IMClient, convId: String, text: String): Message {
             val r = assertIs<SendResult.Ok>(im.send(convId, text))
             return until("sent") { im.messages(convId).firstOrNull { it.clientMsgId == r.message.clientMsgId && it.status == MessageStatus.SENT } }
@@ -120,7 +125,7 @@ class ReportIntegrationTest {
     @TestInstance(TestInstance.Lifecycle.PER_CLASS)
     inner class Report : Suite() {
         @BeforeAll
-        fun up() = runBlocking { srv = TestServer.start(MOD_ENV) }
+        fun up() = runBlocking { srv = TestServer.start(MOD_ENV + MODERATION_ENV + ("IM_MSG_ACTIONS_ENABLED" to "1")) } // 撤回要 C4 开关
 
         @Test
         fun `backend-chat 第 96 条：GET v1 config 的 features-moderation 读到 true`() = test {
@@ -147,9 +152,39 @@ class ReportIntegrationTest {
         }
 
         @Test
+        fun `问题 92：没看过的消息 canReport 为 false（已撤回的服务端也回 4040）；打开会话上报已读后为 true，举报成功`() = test {
+            val (u1, u2) = uid("rg") to uid("rh")
+            users(u1, u2)
+            val conv = c2cConvId(u1, u2)
+            val a = login(u1)
+            val b = login(u2)
+            val m1 = sent(a, conv, "ZXQ-RPT-6")
+            val m2 = sent(a, conv, "ZXQ-RPT-7")
+            a.recall(conv, m2.msgId!!)
+            b.loadHistory(conv)
+            val seen = until("u2 loaded") { b.messages(conv).takeIf { l -> l.any { it.msgId == m1.msgId } && l.any { it.msgId == m2.msgId && it.recalled } } }
+            assertTrue(seen.none { b.canReport(it) }, seen.toString())
+            // 服务端同样不认没看过的已撤回消息（readSeq < seq，AC-MOD-03-12）。
+            val e = runCatching { b.report(ReportTarget.Messages(conv, listOf(m2.msgId!!)), ReportReason.ABUSE) }.exceptionOrNull()
+            assertIs<IMError>(e)
+            assertEquals(4040 to "reportTargetInvalid", e.code to e.reason)
+            b.setActiveConversation(conv)
+            until("u2 read") { b.conversations.value.firstOrNull { it.convId == conv }?.readSeq == m2.seq }
+            val now = b.messages(conv)
+            assertTrue(b.canReport(now.single { it.msgId == m1.msgId }))
+            assertTrue(b.canReport(now.single { it.msgId == m2.msgId }))
+            delay(300) // 已读帧先到服务端
+            assertTrue(ID.matches(b.report(ReportTarget.Messages(conv, listOf(m2.msgId!!)), ReportReason.ABUSE)))
+            // 自己的消息（含被撤回的）对发送者都没有。
+            assertTrue(a.messages(conv).none { a.canReport(it) })
+        }
+
+        @Test
         fun `举报用户、群：成功；非参与者举报消息、举报不存在的用户都是 4040 reportTargetInvalid（响应相同）`() = test {
             val (u1, u2, u3) = Triple(uid("rc"), uid("rd"), uid("re"))
-            users(u1, u2, u3)
+            val u4 = uid("rf")
+            users(u1, u2, u3, u4)
+            friends(u1, u2, u4)
             val conv = c2cConvId(u1, u2)
             val a = login(u1)
             val b = login(u2)
@@ -157,7 +192,7 @@ class ReportIntegrationTest {
             val m = sent(a, conv, "ZXQ-RPT-4")
             until("u2 has conv") { b.conversations.value.firstOrNull { it.convId == conv } }
             assertTrue(ID.matches(b.report(ReportTarget.User(u1), ReportReason.SPAM)))
-            val g = a.createGroup(listOf(u2), "ZXQ 举报群")
+            val g = a.createGroup(listOf(u2, u4), "ZXQ 举报群")
             until("u2 in group") { b.conversations.value.firstOrNull { it.convId == groupConvId(g.groupId) } }
             assertTrue(ID.matches(b.report(ReportTarget.Group(g.groupId), ReportReason.ILLEGAL)))
 
@@ -220,10 +255,13 @@ class ReportIntegrationTest {
 
         @Test
         fun `建群的群名含特征词：IMError 4510 原样抛出，不带 details`() = test {
-            val (u1, u2) = uid("bc") to uid("bd")
-            users(u1, u2)
+            val (u1, u2, u3) = Triple(uid("bc"), uid("bd"), uid("be"))
+            users(u1, u2, u3)
+            friends(u1, u2, u3)
             val a = login(u1)
-            val e = runCatching { a.createGroup(listOf(u2), "群 $WORD") }.exceptionOrNull()
+            // 对照：同样的成员、正常群名可以建（排除 4000、4035 等其他原因）。
+            assertTrue(ID.matches(a.createGroup(listOf(u2, u3), "正常群名").groupId))
+            val e = runCatching { a.createGroup(listOf(u2, u3), "群 $WORD") }.exceptionOrNull()
             assertIs<IMError>(e)
             assertEquals(4510, e.code)
             assertNull(e.details)

@@ -206,7 +206,7 @@ messageFor("send", 4510)            // "消息包含不当内容，无法发送"
 | 规则 | 说明 |
 |---|---|
 | `report` | 本地先校验：`msgIds` 1～20 条合法 ID，`note` 不超过 200 个码点，`convId` 严格格式（单聊自己必须是参与者，聊天室不能举报），`userId`、`groupId` 格式；不合法直接抛 `IMError` 4000（`details.field`），不发帧。对象类型由 `ReportTarget` 保证互斥。服务端的 4292、4040 `reportTargetInvalid`、4030 `featureDisabled`、4290、5000、超时、未连接原样抛出，不自动重试（文案 `messageFor("report", code)`：4040"无法举报该内容"、4030"举报功能暂不可用"、4292"今天的举报次数已用完"）。`note` 不进日志和错误信息 |
-| `canReport` | 别人发的、已经发送成功的 `text`、`image`、`file`；自己的、`tip`、`custom`、发送中和失败的、后台删除的都没有；撤回提示行只在**别人**撤回的消息上有（自己以群主、管理员身份撤回的没有）。不看 `features.moderation`，开关由页面判断；资料卡、群信息页的入口由页面判断 |
+| `canReport` | 别人发的、已经发送成功的 `text`、`image`、`file`；自己的、`tip`、`custom`、发送中和失败的、后台删除的都没有；撤回提示行只在**别人**撤回的消息上有（自己以群主、管理员身份撤回的没有，别人撤回的我的也没有）；只有看过的（`seq ≤` 会话的 `readSeq`，服务端按 `readSeq ≥ seq` 校验，问题 92），会话不在本地列表里的没有。不看 `features.moderation`，开关由页面判断；资料卡、群信息页的入口由页面判断 |
 | 4510 | `send`、`sendImage`、`sendFile` 收到 4510：消息标记失败、`error = SendError.Code(4510)`，不自动重发、不重新上传，`retry` 也不发；超时之后才到的 4510 同样改成 4510（不再发 `SendFailed`）。失败原因在本地库消息的 json 里，冷启动后仍是 4510、仍不能重发。错误里没有命中的词。其他 WS 命令（建群、改群名等）原样抛 `IMError` 4510；账号接口（注册、改昵称）抛 `AccountError(status = 451, code = 4510)` |
 
 ## 开发
@@ -241,7 +241,7 @@ TIANTING_SERVER_DIR=/path/to/tianting-server/server ./gradlew :sdk-core:integrat
 
 `ConvSettingsIntegrationTest`（C5）用 `IM_CONV_SETTINGS_ENABLED=1`；服务端命令（BE-483～486）完成之前 `convSet`、`convDelete` 回 4001，这些用例如实失败，不跳过。
 
-`ReportIntegrationTest`（C6）用 `IM_MOD_ENABLED=1` 和测试用的 `IM_REPORT_KEY`，4510 的服务端另给调用方 `moderation.words` scope 加特征词；服务端（BE-492～496）完成之前 `features.moderation` 是 false、`report` 回 4001、不认识这个 scope（服务端启动失败），这些用例如实失败，不跳过。
+`ReportIntegrationTest`（C6）用 `IM_MOD_ENABLED=1` 和测试用的 `IM_REPORT_KEY`，4510 的服务端另给调用方 `moderation.words` scope 加特征词；举报那组另开 `IM_MSG_ACTIONS_ENABLED=1`（撤回）。服务端 BE-492～498 完成后（tianting-server@d91a48b）全部通过。
 
 CI 里的集成测试需要读取私有仓库 tianting-server：配置只读部署密钥和 Actions secret `TIANTING_SERVER_DEPLOY_KEY`。没配置时 CI 跳过集成测试，只跑单元测试。
 

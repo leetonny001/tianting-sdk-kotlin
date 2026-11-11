@@ -653,13 +653,18 @@ public class IMClient(private val o: IMClientOptions) {
     /**
      * 消息菜单里有没有"举报"（frontend-chat 第 77、88 条，三套 SDK 同一口径）：别人发的、已经发送成功的 text、image、file；
      * 自己的、tip、custom、发送中和失败的都没有；后台删除的没有。撤回提示行只在**别人**撤回的消息上有（隔离原文过期后点了
-     * 仍会成功，证据只有元数据，AC-MOD-03-12），我自己（群主、管理员）撤回的别人的消息没有。
+     * 仍会成功，证据只有元数据，AC-MOD-03-12），我自己（群主、管理员）撤回的别人的消息没有，别人撤回的我的消息也没有。
+     * 只有已读范围内的（seq ≤ 会话的 readSeq，服务端按 readSeq ≥ seq 校验，问题 92）；会话不在本地列表里的一律没有。
      * 不看 features.moderation：开关关闭时页面不显示任何举报入口（第 76 条）。资料卡、群信息页的入口由页面判断。可以从任意线程调。
      */
     public fun canReport(m: Message): Boolean {
         val me = self
         if (m.status != MessageStatus.SENT || m.msgId == null || me.isEmpty() || m.from == me) return false
         if (m.type != MsgType.TEXT && m.type != MsgType.IMAGE && m.type != MsgType.FILE) return false
+        // 只有看过的才能举报（服务端校验 readSeq ≥ seq，问题 92）；会话不在本地列表里的不显示。
+        val seq = m.seq ?: return false
+        val conv = _conversations.value.firstOrNull { it.convId == m.convId } ?: return false
+        if (seq > conv.readSeq) return false
         if (m.recalled) return m.recalledBy != me
         return !m.deleted
     }
